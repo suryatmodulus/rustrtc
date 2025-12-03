@@ -201,7 +201,7 @@ pub fn track_from_source(
     capacity: usize,
 ) -> MediaResult<(Arc<SampleStreamTrack>, JoinHandle<MediaResult<()>>)> {
     let kind = source.kind();
-    let (sample_source, track) = sample_track(kind, capacity);
+    let (sample_source, track, _feedback_rx) = sample_track(kind, capacity);
     let sink: Arc<DynMediaSink> = Arc::new(TrackMediaSink::new(Arc::new(sample_source)));
     let pump = spawn_media_pump(source, sink)?;
     Ok((track, pump))
@@ -219,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn track_media_source_yields_samples() {
-        let (source, track) = sample_track(MediaKind::Audio, 1);
+        let (source, track, _) = sample_track(MediaKind::Audio, 1);
         let mut track_source = TrackMediaSource::new(track.clone());
         source
             .send_audio(AudioFrame {
@@ -257,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn track_media_sink_pushes_samples() {
-        let (sample_source, track) = sample_track(MediaKind::Audio, 1);
+        let (sample_source, track, _) = sample_track(MediaKind::Audio, 1);
         let sink = TrackMediaSink::new(Arc::new(sample_source));
         sink.consume(MediaSample::Audio(AudioFrame::default()))
             .await
@@ -268,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn media_pump_moves_samples_until_end_of_stream() {
-        let (source_handle, track) = sample_track(MediaKind::Audio, 1);
+        let (source_handle, track, _) = sample_track(MediaKind::Audio, 1);
         let source: Box<DynMediaSource> = Box::new(TrackMediaSource::new(track.clone()));
         let (sink_impl, mut receiver) = ChannelMediaSink::channel(MediaKind::Audio, 1);
         let sink: Arc<DynMediaSink> = Arc::new(sink_impl);
@@ -291,7 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn media_pump_rejects_kind_mismatch() {
-        let (_source_handle, track) = sample_track(MediaKind::Audio, 1);
+        let (_source_handle, track, _) = sample_track(MediaKind::Audio, 1);
         let source: Box<DynMediaSource> = Box::new(TrackMediaSource::new(track));
         let (sink_impl, _receiver) = ChannelMediaSink::channel(MediaKind::Video, 1);
         let sink: Arc<DynMediaSink> = Arc::new(sink_impl);
@@ -301,7 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn media_pump_propagates_sink_error() {
-        let (source_handle, track) = sample_track(MediaKind::Audio, 1);
+        let (source_handle, track, _) = sample_track(MediaKind::Audio, 1);
         let source: Box<DynMediaSource> = Box::new(TrackMediaSource::new(track));
         let (sink_impl, receiver) = ChannelMediaSink::channel(MediaKind::Audio, 1);
         drop(receiver);
@@ -321,7 +321,7 @@ mod tests {
     async fn channel_source_with_pump_to_track_sink() {
         let (sender, channel_source) = ChannelMediaSource::channel(MediaKind::Audio, 1);
         let source: Box<DynMediaSource> = Box::new(channel_source);
-        let (track_source, track) = sample_track(MediaKind::Audio, 1);
+        let (track_source, track, _) = sample_track(MediaKind::Audio, 1);
         let sink: Arc<DynMediaSink> = Arc::new(TrackMediaSink::new(Arc::new(track_source)));
         let pump = spawn_media_pump(source, sink).unwrap();
 
@@ -342,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn track_from_source_creates_track_and_pump() {
-        let (producer, upstream_track) = sample_track(MediaKind::Audio, 1);
+        let (producer, upstream_track, _) = sample_track(MediaKind::Audio, 1);
         let media_source: Box<DynMediaSource> = Box::new(TrackMediaSource::new(upstream_track));
         let (track, pump) = track_from_source(media_source, 1).unwrap();
 

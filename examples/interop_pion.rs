@@ -171,7 +171,7 @@ async fn run_client(addr_str: &str) {
     });
 
     // Create Video Track
-    let (source, track) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 96);
+    let (source, track, _) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 96);
     let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(track, 12345));
     sender.set_params(rustrtc::peer_connection::RtpCodecParameters {
         payload_type: 96,

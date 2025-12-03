@@ -1,8 +1,8 @@
-use std::time::{Duration, Instant};
-use rustrtc::{PeerConnection, RtcConfiguration};
+use indicatif::{ProgressBar, ProgressStyle};
 use rustrtc::media::MediaKind;
 use rustrtc::media::track::sample_track;
-use indicatif::{ProgressBar, ProgressStyle};
+use rustrtc::{PeerConnection, RtcConfiguration};
+use std::time::{Duration, Instant};
 
 #[tokio::main]
 async fn main() {
@@ -10,15 +10,22 @@ async fn main() {
     // tracing_subscriber::fmt::init();
 
     let count = 50;
-    println!("Running latency optimization test with {} iterations...", count);
+    println!(
+        "Running latency optimization test with {} iterations...",
+        count
+    );
 
     let mut latencies = Vec::with_capacity(count);
 
     let pb = ProgressBar::new(count as u64);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-        .unwrap()
-        .progress_chars("#>-"));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
 
     for _ in 0..count {
         let latency = run_single_iteration().await;
@@ -52,7 +59,7 @@ async fn run_single_iteration() -> Option<u128> {
     let pc2 = PeerConnection::new(config);
 
     // Add audio track
-    let (_source, track) = sample_track(MediaKind::Audio, 100);
+    let (_source, track, _) = sample_track(MediaKind::Audio, 100);
     let _ = pc1.add_track(track);
 
     let _ = pc1.create_data_channel("bench", None);
@@ -62,31 +69,39 @@ async fn run_single_iteration() -> Option<u128> {
         Ok(o) => o,
         Err(_) => return None,
     };
-    if pc1.set_local_description(offer.clone()).is_err() { return None; }
+    if pc1.set_local_description(offer.clone()).is_err() {
+        return None;
+    }
     pc1.wait_for_gathering_complete().await;
     let offer = match pc1.local_description() {
         Some(o) => o,
         None => return None,
     };
 
-    if pc2.set_remote_description(offer).await.is_err() { return None; }
+    if pc2.set_remote_description(offer).await.is_err() {
+        return None;
+    }
 
     let answer = match pc2.create_answer().await {
         Ok(a) => a,
         Err(_) => return None,
     };
-    if pc2.set_local_description(answer.clone()).is_err() { return None; }
+    if pc2.set_local_description(answer.clone()).is_err() {
+        return None;
+    }
     pc2.wait_for_gathering_complete().await;
     let answer = match pc2.local_description() {
         Some(a) => a,
         None => return None,
     };
 
-    if pc1.set_remote_description(answer).await.is_err() { return None; }
+    if pc1.set_remote_description(answer).await.is_err() {
+        return None;
+    }
 
     // Wait for connection
     let conn_start = Instant::now();
-    
+
     let fut1 = pc1.wait_for_connection();
     let fut2 = pc2.wait_for_connection();
 
@@ -98,13 +113,13 @@ async fn run_single_iteration() -> Option<u128> {
     match res {
         (Ok(Ok(_)), Ok(Ok(_))) => {
             let latency = conn_start.elapsed().as_millis();
-            
+
             // Cleanup
             pc1.close();
             pc2.close();
-            
+
             Some(latency)
-        },
+        }
         _ => {
             pc1.close();
             pc2.close();

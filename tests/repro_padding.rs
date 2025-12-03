@@ -25,7 +25,7 @@ async fn test_padding_packet_drop() -> Result<()> {
     let pc2 = PeerConnection::new(config2);
 
     // Setup Sending on PC1 (Before Negotiation)
-    let (client_source, client_track) =
+    let (client_source, client_track, _) =
         rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 96);
 
     // PC1 adds transceiver with sender
@@ -61,7 +61,7 @@ async fn test_padding_packet_drop() -> Result<()> {
     let t2 = pc2.get_transceivers().first().unwrap().clone();
 
     // Create a sender for PC2 to echo back
-    let (sample_source, outgoing_track) =
+    let (sample_source, outgoing_track, _) =
         rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 96);
     let s2 = Arc::new(rustrtc::peer_connection::RtpSender::new(
         outgoing_track,

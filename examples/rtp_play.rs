@@ -33,7 +33,7 @@ async fn main() {
     config.transport_mode = TransportMode::Rtp;
     let pc = PeerConnection::new(config);
 
-    let (sample_source, track) = rustrtc::media::sample_track(MediaKind::Video, 100);
+    let (sample_source, track, _) = rustrtc::media::sample_track(MediaKind::Video, 100);
     pc.add_track(track).expect("failed to add track");
 
     let offer = pc.create_offer().await.expect("failed to create offer");

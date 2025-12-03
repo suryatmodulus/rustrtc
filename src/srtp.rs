@@ -178,6 +178,7 @@ pub struct SrtpContext {
     rtp_keys: SessionKeys,
     rtcp_keys: SessionKeys,
     rtp_gcm_cipher: Option<Aes128Gcm>,
+    rtcp_gcm_cipher: Option<Aes128Gcm>,
     rtp_auth_prototype: Option<HmacSha1>,
     direction: SrtpDirection,
     rollover_counter: u32,
@@ -220,6 +221,15 @@ impl SrtpContext {
             None
         };
 
+        let rtcp_gcm_cipher = if let SrtpProfile::AeadAes128Gcm = profile {
+            Some(
+                Aes128Gcm::new_from_slice(&rtcp_keys.cipher_key)
+                    .map_err(|_| SrtpError::UnsupportedProfile)?,
+            )
+        } else {
+            None
+        };
+
         let rtp_auth_prototype = if !rtp_keys.auth_key.is_empty() {
             Some(
                 <HmacSha1 as Mac>::new_from_slice(&rtp_keys.auth_key)
@@ -235,6 +245,7 @@ impl SrtpContext {
             rtp_keys,
             rtcp_keys,
             rtp_gcm_cipher,
+            rtcp_gcm_cipher,
             rtp_auth_prototype,
             direction,
             rollover_counter: 0,
@@ -316,6 +327,38 @@ impl SrtpContext {
         // E-bit = 1 (Encrypted)
         let index_with_e = index | 0x8000_0000;
 
+        if let SrtpProfile::AeadAes128Gcm = self._profile {
+            let nonce = self.build_gcm_rtcp_nonce(index);
+            let cipher = self
+                .rtcp_gcm_cipher
+                .as_ref()
+                .ok_or(SrtpError::UnsupportedProfile)?;
+
+            // AAD = Header (8 bytes) || Index (4 bytes, WITHOUT E-bit)
+            let mut aad = Vec::with_capacity(12);
+            aad.extend_from_slice(&packet[..8]);
+            aad.extend_from_slice(&index.to_be_bytes());
+
+            // Payload = Packet body (after header)
+            let payload_data = &packet[8..];
+
+            let payload = Payload {
+                msg: payload_data,
+                aad: &aad,
+            };
+
+            let ciphertext = cipher
+                .encrypt(Nonce::from_slice(&nonce), payload)
+                .map_err(|_| SrtpError::AuthenticationFailed)?;
+
+            // Reconstruct packet: Header || Ciphertext || Index
+            packet.truncate(8);
+            packet.extend_from_slice(&ciphertext);
+            packet.extend_from_slice(&index_with_e.to_be_bytes());
+            
+            return Ok(());
+        }
+
         // Encrypt payload (everything after first 8 bytes of header)
         // RFC 3711: The first 8 octets of the RTCP header are not encrypted.
         if packet.len() > 8 {
@@ -336,6 +379,54 @@ impl SrtpContext {
         let tag_len = self._profile.tag_len();
         if packet.len() < tag_len + 4 {
             return Err(SrtpError::PacketTooShort);
+        }
+
+        if let SrtpProfile::AeadAes128Gcm = self._profile {
+            // Read Index
+            let index_bytes = &packet[packet.len() - 4..];
+            let index_with_e = u32::from_be_bytes([
+                index_bytes[0],
+                index_bytes[1],
+                index_bytes[2],
+                index_bytes[3],
+            ]);
+            let index = index_with_e & 0x7FFF_FFFF;
+
+            // Replay check
+            if index > self.rtcp_index {
+                self.rtcp_index = index;
+            }
+
+            let nonce = self.build_gcm_rtcp_nonce(index);
+            let cipher = self
+                .rtcp_gcm_cipher
+                .as_ref()
+                .ok_or(SrtpError::UnsupportedProfile)?;
+
+            // AAD = Header (8 bytes) || Index (4 bytes, WITHOUT E-bit)
+            let mut aad = Vec::with_capacity(12);
+            aad.extend_from_slice(&packet[..8]);
+            aad.extend_from_slice(&index.to_be_bytes());
+
+            // Ciphertext = Packet body (after header, before index)
+            // Note: Tag is appended to ciphertext in GCM encrypt output.
+            // So Ciphertext + Tag is what we have between Header and Index.
+            let ciphertext_and_tag = &packet[8..packet.len() - 4];
+
+            let payload = Payload {
+                msg: ciphertext_and_tag,
+                aad: &aad,
+            };
+
+            let plaintext = cipher
+                .decrypt(Nonce::from_slice(&nonce), payload)
+                .map_err(|_| SrtpError::AuthenticationFailed)?;
+
+            // Reconstruct packet: Header || Plaintext
+            packet.truncate(8);
+            packet.extend_from_slice(&plaintext);
+            
+            return Ok(());
         }
 
         // Split tag
@@ -528,6 +619,20 @@ impl SrtpContext {
         let result = mac.finalize().into_bytes();
         let tag_len = self._profile.tag_len();
         Ok(result[..tag_len].to_vec())
+    }
+
+    fn build_gcm_rtcp_nonce(&self, index: u32) -> [u8; 12] {
+        let mut iv = [0u8; 12];
+        iv.copy_from_slice(&self.rtcp_keys.salt[..12]);
+
+        let mut block = [0u8; 12];
+        block[2..6].copy_from_slice(&self.ssrc.to_be_bytes());
+        block[6..10].copy_from_slice(&index.to_be_bytes());
+
+        for i in 0..12 {
+            iv[i] ^= block[i];
+        }
+        iv
     }
 
     fn build_gcm_nonce(&self, sequence: u16, roc: u32) -> [u8; 12] {

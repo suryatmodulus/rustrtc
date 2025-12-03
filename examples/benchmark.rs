@@ -1,11 +1,11 @@
+use indicatif::{ProgressBar, ProgressStyle};
 use std::env;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::time::sleep;
-use indicatif::{ProgressBar, ProgressStyle};
 
 // rustrtc imports
 use rustrtc::media::MediaKind;
@@ -39,7 +39,10 @@ impl BenchResult {
         println!("------------------------------------------------");
         println!("Total Duration:      {:.2?}", self.duration);
         println!("Setup Latency:       {:.2} ms (avg)", self.dc_latency);
-        println!("Total Data:          {:.2} MB", self.bytes as f64 / 1024.0 / 1024.0);
+        println!(
+            "Total Data:          {:.2} MB",
+            self.bytes as f64 / 1024.0 / 1024.0
+        );
         println!("Total Messages:      {}", self.msgs);
         println!("Throughput:          {:.2} MB/s", self.throughput());
         println!("Message Rate:        {:.2} msg/s", self.msg_rate());
@@ -72,16 +75,16 @@ async fn main() {
         .init();
 
     let args: Vec<String> = env::args().collect();
-    
+
     if args.len() <= 1 {
         println!("No arguments provided. Running comparison mode (count=10).");
-        
+
         let exe = env::current_exe().expect("Failed to get current executable path");
         let mut results = Vec::new();
 
         println!("\nPausing for 3 seconds...");
         sleep(Duration::from_secs(3)).await;
-        
+
         // Run webrtc in subprocess
         println!("\nRunning webrtc benchmark...");
         let webrtc_output = Command::new(&exe)
@@ -89,16 +92,16 @@ async fn main() {
             .arg("10")
             .output()
             .expect("Failed to run webrtc benchmark");
-            
+
         let webrtc_stdout = String::from_utf8_lossy(&webrtc_output.stdout);
         println!("{}", webrtc_stdout);
         if let Some(res) = parse_output(&webrtc_stdout, "webrtc") {
             results.push(res);
         }
-        
+
         println!("\nPausing for 3 seconds...");
         sleep(Duration::from_secs(3)).await;
-        
+
         // Run rustrtc in subprocess
         println!("\nRunning rustrtc benchmark...");
         let rustrtc_output = Command::new(&exe)
@@ -106,7 +109,7 @@ async fn main() {
             .arg("10")
             .output()
             .expect("Failed to run rustrtc benchmark");
-            
+
         let rustrtc_stdout = String::from_utf8_lossy(&rustrtc_output.stdout);
         println!("{}", rustrtc_stdout);
         if let Some(res) = parse_output(&rustrtc_stdout, "rustrtc") {
@@ -124,20 +127,20 @@ async fn main() {
                     .arg("10")
                     .output()
                     .expect("Failed to run Pion benchmark");
-                
+
                 let pion_stdout = String::from_utf8_lossy(&pion_output.stdout);
                 println!("{}", pion_stdout);
                 if let Some(res) = parse_output(&pion_stdout, "pion") {
                     results.push(res);
                 }
-                
+
                 // Cleanup
                 let _ = std::fs::remove_file(pion_exe);
             }
         } else {
             println!("\nGo compiler not found. Skipping Pion benchmark.");
         }
-        
+
         if !results.is_empty() {
             print_comparison_table(&results);
             print_bar_charts(&results);
@@ -217,12 +220,11 @@ fn parse_output(output: &str, mode: &str) -> Option<BenchResult> {
     })
 }
 
-
 async fn run_benchmark(mode: &str, count: usize) -> BenchResult {
     println!("Starting benchmark: mode={}, count={}", mode, count);
-    
+
     let (peak_rss, avg_cpu, cpu_samples, running) = start_resource_monitor();
-    
+
     let start = Instant::now();
     let (dc_latency, bytes, msgs) = match mode {
         "rustrtc" => run_rustrtc(count).await,
@@ -230,16 +232,16 @@ async fn run_benchmark(mode: &str, count: usize) -> BenchResult {
         _ => panic!("Unknown mode. Use 'rustrtc' or 'webrtc'"),
     };
     let duration = start.elapsed();
-    
+
     running.store(false, Ordering::Relaxed);
-    
+
     let samples = cpu_samples.load(Ordering::Relaxed);
     let avg_cpu_val = if samples > 0 {
         avg_cpu.load(Ordering::Relaxed) as f64 / samples as f64 / 100.0
     } else {
         0.0
     };
-    
+
     BenchResult {
         mode: mode.to_string(),
         duration,
@@ -251,13 +253,18 @@ async fn run_benchmark(mode: &str, count: usize) -> BenchResult {
     }
 }
 
-fn start_resource_monitor() -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicBool>) {
+fn start_resource_monitor() -> (
+    Arc<AtomicU64>,
+    Arc<AtomicU64>,
+    Arc<AtomicU64>,
+    Arc<AtomicBool>,
+) {
     let pid = std::process::id();
     let peak_rss = Arc::new(AtomicU64::new(0));
     let avg_cpu = Arc::new(AtomicU64::new(0));
     let cpu_samples = Arc::new(AtomicU64::new(0));
     let running = Arc::new(AtomicBool::new(true));
-    
+
     let peak_rss_clone = peak_rss.clone();
     let avg_cpu_clone = avg_cpu.clone();
     let cpu_samples_clone = cpu_samples.clone();
@@ -294,7 +301,7 @@ fn start_resource_monitor() -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>, 
             sleep(Duration::from_millis(500)).await;
         }
     });
-    
+
     (peak_rss, avg_cpu, cpu_samples, running)
 }
 
@@ -310,7 +317,7 @@ fn build_go_benchmark() -> Option<String> {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let go_bench_dir = std::path::Path::new(&manifest_dir).join("examples/go_bench");
     let output_exe = std::path::Path::new(&manifest_dir).join("benchmark_go");
-    
+
     let status = Command::new("go")
         .arg("build")
         .arg("-o")
@@ -330,12 +337,15 @@ fn print_comparison_table(results: &[BenchResult]) {
     if results.is_empty() {
         return;
     }
-    
+
     // Find baseline (webrtc)
-    let baseline = results.iter().find(|r| r.mode == "webrtc").unwrap_or(&results[0]);
-    
+    let baseline = results
+        .iter()
+        .find(|r| r.mode == "webrtc")
+        .unwrap_or(&results[0]);
+
     println!("\nComparison (Baseline: {})", baseline.mode);
-    
+
     // Header
     print!("{:<20}", "Metric");
     for res in results {
@@ -343,14 +353,27 @@ fn print_comparison_table(results: &[BenchResult]) {
     }
     println!();
     println!("{:-<80}", "");
-    
+
     let metrics = [
-        ("Duration (s)", Box::new(|r: &BenchResult| r.duration.as_secs_f64()) as Box<dyn Fn(&BenchResult) -> f64>),
-        ("Setup Latency (ms)", Box::new(|r: &BenchResult| r.dc_latency)),
-        ("Throughput (MB/s)", Box::new(|r: &BenchResult| r.throughput())),
+        (
+            "Duration (s)",
+            Box::new(|r: &BenchResult| r.duration.as_secs_f64())
+                as Box<dyn Fn(&BenchResult) -> f64>,
+        ),
+        (
+            "Setup Latency (ms)",
+            Box::new(|r: &BenchResult| r.dc_latency),
+        ),
+        (
+            "Throughput (MB/s)",
+            Box::new(|r: &BenchResult| r.throughput()),
+        ),
         ("Msg Rate (msg/s)", Box::new(|r: &BenchResult| r.msg_rate())),
         ("CPU Usage (%)", Box::new(|r: &BenchResult| r.cpu_usage)),
-        ("Memory (MB)", Box::new(|r: &BenchResult| r.memory_rss as f64)),
+        (
+            "Memory (MB)",
+            Box::new(|r: &BenchResult| r.memory_rss as f64),
+        ),
     ];
 
     for (name, getter) in metrics.iter() {
@@ -367,20 +390,44 @@ fn print_comparison_table(results: &[BenchResult]) {
 fn print_bar_charts(results: &[BenchResult]) {
     println!("\nPerformance Charts");
     println!("==================");
-    
+
     let metrics = [
-        ("Throughput (MB/s)", true, Box::new(|r: &BenchResult| r.throughput()) as Box<dyn Fn(&BenchResult) -> f64>),
-        ("Message Rate (msg/s)", true, Box::new(|r: &BenchResult| r.msg_rate())),
-        ("Setup Latency (ms)", false, Box::new(|r: &BenchResult| r.dc_latency)),
-        ("CPU Usage (%)", false, Box::new(|r: &BenchResult| r.cpu_usage)),
-        ("Memory (MB)", false, Box::new(|r: &BenchResult| r.memory_rss as f64)),
+        (
+            "Throughput (MB/s)",
+            true,
+            Box::new(|r: &BenchResult| r.throughput()) as Box<dyn Fn(&BenchResult) -> f64>,
+        ),
+        (
+            "Message Rate (msg/s)",
+            true,
+            Box::new(|r: &BenchResult| r.msg_rate()),
+        ),
+        (
+            "Setup Latency (ms)",
+            false,
+            Box::new(|r: &BenchResult| r.dc_latency),
+        ),
+        (
+            "CPU Usage (%)",
+            false,
+            Box::new(|r: &BenchResult| r.cpu_usage),
+        ),
+        (
+            "Memory (MB)",
+            false,
+            Box::new(|r: &BenchResult| r.memory_rss as f64),
+        ),
     ];
 
     for (name, higher_is_better, getter) in metrics.iter() {
-        let remark = if *higher_is_better { "Higher is better" } else { "Lower is better" };
+        let remark = if *higher_is_better {
+            "Higher is better"
+        } else {
+            "Lower is better"
+        };
         println!("\n{} ({})", name, remark);
         let max_val = results.iter().map(|r| getter(r)).fold(0.0, f64::max);
-        
+
         for res in results {
             let val = getter(res);
             let bar_len = if max_val > 0.0 {
@@ -388,7 +435,7 @@ fn print_bar_charts(results: &[BenchResult]) {
             } else {
                 0
             };
-            
+
             let color = match res.mode.as_str() {
                 "rustrtc" => "\x1b[32m", // Green
                 "webrtc" => "\x1b[34m",  // Blue
@@ -398,13 +445,14 @@ fn print_bar_charts(results: &[BenchResult]) {
             let reset = "\x1b[0m";
 
             let bar: String = std::iter::repeat("█").take(bar_len).collect();
-            println!("{:<10} | {}{:<40}{} {:.2}", res.mode, color, bar, reset, val);
+            println!(
+                "{:<10} | {}{:<40}{} {:.2}",
+                res.mode, color, bar, reset, val
+            );
         }
     }
     println!();
 }
-
-
 
 async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
     let mut handles = vec![];
@@ -413,24 +461,28 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
     let total_dc_latency = Arc::new(AtomicU64::new(0)); // in micros
 
     let pb = ProgressBar::new(count as u64);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-        .unwrap()
-        .progress_chars("#>-"));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
 
     for _ in 0..count {
         let total_bytes = total_bytes.clone();
         let total_msgs = total_msgs.clone();
         let total_dc_latency = total_dc_latency.clone();
         let pb = pb.clone();
-        
+
         handles.push(tokio::spawn(async move {
             let config = RtcConfiguration::default();
             let pc1 = PeerConnection::new(config.clone());
             let pc2 = PeerConnection::new(config);
 
             // Add audio track
-            let (_source, track) = sample_track(MediaKind::Audio, 100);
+            let (_source, track, _) = sample_track(MediaKind::Audio, 100);
             pc1.add_track(track).unwrap();
 
             let dc1 = pc1.create_data_channel("bench", None).unwrap();
@@ -451,11 +503,15 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
             pc1.set_remote_description(answer).await.unwrap();
 
             // Wait for connection
-            if let Err(_) = tokio::time::timeout(Duration::from_secs(10), pc1.wait_for_connection()).await {
+            if let Err(_) =
+                tokio::time::timeout(Duration::from_secs(10), pc1.wait_for_connection()).await
+            {
                 // println!("Timeout waiting for pc1 connection");
                 return;
             }
-            if let Err(_) = tokio::time::timeout(Duration::from_secs(10), pc2.wait_for_connection()).await {
+            if let Err(_) =
+                tokio::time::timeout(Duration::from_secs(10), pc2.wait_for_connection()).await
+            {
                 // println!("Timeout waiting for pc2 connection");
                 return;
             }
@@ -481,7 +537,9 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
             let mut dc2 = None;
             let start_wait = Instant::now();
             while start_wait.elapsed() < Duration::from_secs(5) {
-                if let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(1), pc2.recv()).await {
+                if let Ok(Some(event)) =
+                    tokio::time::timeout(Duration::from_secs(1), pc2.recv()).await
+                {
                     match event {
                         PeerConnectionEvent::DataChannel(dc) => {
                             dc2 = Some(dc);
@@ -491,7 +549,7 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
                     }
                 }
             }
-            
+
             if dc2.is_none() {
                 // println!("Failed to get data channel");
                 pb.inc(1); // Mark as done even if failed, to advance progress
@@ -501,7 +559,7 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
 
             // Send data
             let data = vec![0u8; 1024]; // 1KB
-            
+
             // Receiver loop
             let dc2_clone = dc2.clone();
             let total_bytes_clone = total_bytes.clone();
@@ -537,12 +595,12 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
                 if remaining.is_zero() {
                     break;
                 }
-                
+
                 match tokio::time::timeout(remaining, pc1.send_data(dc1.id, &data)).await {
-                    Ok(Ok(_)) => {},
+                    Ok(Ok(_)) => {}
                     _ => break, // Timeout or Send Error
                 }
-                
+
                 // Small delay to avoid overwhelming buffer if any
                 tokio::task::yield_now().await;
             }
@@ -550,7 +608,7 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
             // Close connections
             pc1.close();
             pc2.close();
-            
+
             // Wait for receiver to finish (it will finish when channel closes)
             let _ = tokio::time::timeout(Duration::from_secs(5), done.notified()).await;
             pb.inc(1);
@@ -565,7 +623,7 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
     (
         total_dc_latency.load(Ordering::Relaxed) as f64 / count as f64 / 1000.0,
         total_bytes.load(Ordering::Relaxed),
-        total_msgs.load(Ordering::Relaxed)
+        total_msgs.load(Ordering::Relaxed),
     )
 }
 
@@ -576,17 +634,21 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
     let total_dc_latency = Arc::new(AtomicU64::new(0));
 
     let pb = ProgressBar::new(count as u64);
-    pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-        .unwrap()
-        .progress_chars("#>-"));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
+            .unwrap()
+            .progress_chars("#>-"),
+    );
 
     for _ in 0..count {
         let total_bytes = total_bytes.clone();
         let total_msgs = total_msgs.clone();
         let total_dc_latency = total_dc_latency.clone();
         let pb = pb.clone();
-        
+
         handles.push(tokio::spawn(async move {
             let mut m1 = MediaEngine::default();
             m1.register_default_codecs().unwrap();
@@ -722,8 +784,6 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
     (
         total_dc_latency.load(Ordering::Relaxed) as f64 / count as f64 / 1000.0,
         total_bytes.load(Ordering::Relaxed),
-        total_msgs.load(Ordering::Relaxed)
+        total_msgs.load(Ordering::Relaxed),
     )
 }
-
-

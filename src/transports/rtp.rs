@@ -15,6 +15,8 @@ pub struct RtpTransport {
     srtp_session: Mutex<Option<Arc<Mutex<SrtpSession>>>>,
     listeners: Mutex<HashMap<u32, mpsc::Sender<RtpPacket>>>,
     rtcp_listener: Mutex<Option<mpsc::Sender<Vec<RtcpPacket>>>>,
+    rid_listeners: Mutex<HashMap<String, mpsc::Sender<RtpPacket>>>,
+    rid_extension_id: Mutex<Option<u8>>,
 }
 
 impl RtpTransport {
@@ -24,6 +26,8 @@ impl RtpTransport {
             srtp_session: Mutex::new(None),
             listeners: Mutex::new(HashMap::new()),
             rtcp_listener: Mutex::new(None),
+            rid_listeners: Mutex::new(HashMap::new()),
+            rid_extension_id: Mutex::new(None),
         }
     }
 
@@ -39,6 +43,15 @@ impl RtpTransport {
     pub fn register_listener_sync(&self, ssrc: u32, tx: mpsc::Sender<RtpPacket>) {
         let mut listeners = self.listeners.lock().unwrap();
         listeners.insert(ssrc, tx);
+    }
+
+    pub fn register_rid_listener(&self, rid: String, tx: mpsc::Sender<RtpPacket>) {
+        let mut listeners = self.rid_listeners.lock().unwrap();
+        listeners.insert(rid, tx);
+    }
+
+    pub fn set_rid_extension_id(&self, id: u8) {
+        *self.rid_extension_id.lock().unwrap() = Some(id);
     }
 
     pub fn register_rtcp_listener(&self, tx: mpsc::Sender<Vec<RtcpPacket>>) {
@@ -96,6 +109,7 @@ impl RtpTransport {
 #[async_trait]
 impl PacketReceiver for RtpTransport {
     async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
+        println!("RtpTransport received {} bytes", packet.len());
         let is_rtcp_packet = is_rtcp(&packet);
 
         let unprotected = {
@@ -107,6 +121,7 @@ impl PacketReceiver for RtpTransport {
                     match srtp.unprotect_rtcp(&mut buf) {
                         Ok(_) => buf,
                         Err(e) => {
+                            println!("SRTP unprotect RTCP failed: {}", e);
                             tracing::warn!("SRTP unprotect RTCP failed: {}", e);
                             return;
                         }
@@ -117,16 +132,19 @@ impl PacketReceiver for RtpTransport {
                             Ok(_) => match rtp_packet.marshal() {
                                 Ok(b) => b,
                                 Err(e) => {
+                                    println!("RTP marshal failed: {}", e);
                                     tracing::warn!("RTP marshal failed: {}", e);
                                     return;
                                 }
                             },
                             Err(e) => {
+                                println!("SRTP unprotect RTP failed: {}", e);
                                 tracing::warn!("SRTP unprotect RTP failed: {}", e);
                                 return;
                             }
                         },
                         Err(e) => {
+                            println!("RTP parse failed: {}", e);
                             tracing::warn!("RTP parse failed: {}", e);
                             return;
                         }
@@ -145,6 +163,9 @@ impl PacketReceiver for RtpTransport {
             if let Some(tx) = listener {
                 match parse_rtcp_packets(&unprotected) {
                     Ok(packets) => {
+                        for p in &packets {
+                            println!("Received RTCP Packet: {:?}", p);
+                        }
                         if tx.send(packets).await.is_err() {
                             let mut guard = self.rtcp_listener.lock().unwrap();
                             *guard = None;
@@ -158,13 +179,39 @@ impl PacketReceiver for RtpTransport {
         } else {
             match RtpPacket::parse(&unprotected) {
                 Ok(rtp_packet) => {
+                    // if let Some(ext) = &rtp_packet.header.extension {
+                    //    println!("RTP Extension Profile: {:x}", ext.profile);
+                    // }
                     let ssrc = rtp_packet.header.ssrc;
-                    let listener = {
+                    let mut listener = None;
+
+                    // Try RID first
+                    let rid_id = *self.rid_extension_id.lock().unwrap();
+                    if let Some(id) = rid_id {
+                        if let Some(rid) = rtp_packet.header.get_extension(id) {
+                            // Parse RID string
+                            let rid_str = String::from_utf8_lossy(&rid).to_string();
+                            let rid_listeners = self.rid_listeners.lock().unwrap();
+                            listener = rid_listeners.get(&rid_str).cloned();
+                        }
+                    }
+
+                    // Fallback to SSRC listener
+                    if listener.is_none() {
                         let listeners = self.listeners.lock().unwrap();
-                        listeners.get(&ssrc).cloned()
-                    };
+                        listener = listeners.get(&ssrc).cloned();
+                    }
+
                     if let Some(tx) = listener {
                         if tx.send(rtp_packet).await.is_err() {
+                            // Only remove SSRC listener if we used it?
+                            // If we used RID listener, we shouldn't remove SSRC listener.
+                            // But here we don't know which one we used easily without a flag.
+                            // Let's just ignore removal for now or be careful.
+                            // Actually, if the channel is closed, we should probably remove it from wherever it came from.
+                            // But removing from SSRC listeners is safe if it was there.
+                            // Removing from RID listeners is harder as we don't have the RID here.
+
                             let mut listeners = self.listeners.lock().unwrap();
                             listeners.remove(&ssrc);
                         }

@@ -649,7 +649,14 @@ impl DtlsInner {
 
         // Use SRTP
         if !srtp_profiles.is_empty() {
-            let selected_profile = srtp_profiles[0];
+            // Prefer SRTP_AES128_CM_HMAC_SHA1_80 (0x0001) if available
+            // otherwise pick the first one
+            let selected_profile = if srtp_profiles.contains(&0x0001) {
+                0x0001
+            } else {
+                srtp_profiles[0]
+            };
+            
             ctx.srtp_profile = Some(selected_profile);
             extensions.extend_from_slice(&[0x00, 0x0e]); // Type 14
             extensions.extend_from_slice(&[0x00, 0x05]); // Length

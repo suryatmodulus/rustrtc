@@ -52,6 +52,38 @@ impl RtpHeader {
         }
     }
 
+    pub fn get_extension(&self, id: u8) -> Option<Vec<u8>> {
+        if let Some(ext) = &self.extension {
+            if ext.profile == 0xBEDE {
+                let mut offset = 0;
+                while offset < ext.data.len() {
+                    let b = ext.data[offset];
+                    if b == 0 {
+                        offset += 1;
+                        continue;
+                    }
+                    let ext_id = b >> 4;
+                    let len = (b & 0x0F) as usize + 1;
+                    offset += 1;
+
+                    if ext_id == 15 {
+                        break;
+                    }
+
+                    if ext_id == id {
+                        if offset + len <= ext.data.len() {
+                            return Some(ext.data[offset..offset + len].to_vec());
+                        } else {
+                            return None;
+                        }
+                    }
+                    offset += len;
+                }
+            }
+        }
+        None
+    }
+
     fn validate(&self) -> RtpResult<()> {
         if self.csrcs.len() > 15 {
             return Err(RtpError::InvalidHeader("too many CSRC entries"));

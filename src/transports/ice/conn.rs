@@ -85,7 +85,7 @@ impl IceConn {
             }
             socket.send_to(buf, remote).await
         } else {
-             // Fallback
+            // Fallback
             let mut socket_rx = self.socket_rx.clone();
             let socket_opt = socket_rx.borrow_and_update().clone();
             if let Some(socket) = socket_opt {
@@ -115,7 +115,7 @@ impl PacketReceiver for IceConn {
         }
 
         let first_byte = packet[0];
-        
+
         // Scope for read lock
         let current_remote = *self.remote_addr.read().unwrap();
 

@@ -313,6 +313,76 @@ impl Attribute {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Simulcast {
+    pub send: Vec<String>,
+    pub recv: Vec<String>,
+}
+
+impl Simulcast {
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut send = Vec::new();
+        let mut recv = Vec::new();
+
+        // Example: send ~1;2 recv 3
+        let parts: Vec<&str> = value.split_whitespace().collect();
+        let mut current_dir = "";
+
+        for part in parts {
+            if part == "send" || part == "recv" {
+                current_dir = part;
+                continue;
+            }
+
+            if current_dir == "send" {
+                send.extend(part.split(';').map(|s| s.to_string()));
+            } else if current_dir == "recv" {
+                recv.extend(part.split(';').map(|s| s.to_string()));
+            }
+        }
+
+        if send.is_empty() && recv.is_empty() {
+            None
+        } else {
+            Some(Self { send, recv })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Rid {
+    pub id: String,
+    pub direction: Direction,
+    pub params: Vec<(String, String)>,
+}
+
+impl Rid {
+    pub fn parse(value: &str) -> Option<Self> {
+        // Example: 1 send pt=100;max-width=1280
+        let mut parts = value.split_whitespace();
+        let id = parts.next()?.to_string();
+        let direction_str = parts.next()?;
+        let direction = Direction::from_attribute(direction_str)?;
+
+        let mut params = Vec::new();
+        if let Some(params_str) = parts.next() {
+            for p in params_str.split(';') {
+                if let Some((k, v)) = p.split_once('=') {
+                    params.push((k.to_string(), v.to_string()));
+                } else {
+                    params.push((p.to_string(), "".to_string()));
+                }
+            }
+        }
+
+        Some(Self {
+            id,
+            direction,
+            params,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NetworkType {
     Internet,
 }

@@ -121,7 +121,7 @@ async fn interop_vp8_echo() -> Result<()> {
     let transceiver = rust_pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
 
     // Create a sample track to send data
-    let (source, track) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 10);
+    let (source, track, _) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 10);
     let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
         track, 12345, // SSRC
     ));
@@ -304,7 +304,7 @@ async fn interop_vp8_echo_with_pli() -> Result<()> {
     let transceiver = rust_pc.add_transceiver(MediaKind::Video, TransceiverDirection::SendRecv);
 
     // Create a sample track to send data
-    let (source, track) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 10);
+    let (source, track, _) = rustrtc::media::sample_track(rustrtc::media::MediaKind::Video, 10);
     let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
         track, 12345, // SSRC
     ));

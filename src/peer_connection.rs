@@ -11,6 +11,7 @@ use crate::{
     Attribute, Direction, MediaKind, MediaSection, Origin, RtcConfiguration, RtcError, RtcResult,
     SdpType, SessionDescription, TransportMode,
 };
+use std::collections::HashMap;
 use std::{
     sync::{
         Arc, Mutex,
@@ -520,6 +521,9 @@ impl PeerConnection {
                 }
 
                 let mut ssrc = None;
+                let mut simulcast = None;
+                let mut rids = Vec::new();
+
                 for attr in &section.attributes {
                     if attr.key == "ssrc"
                         && let Some(val) = &attr.value
@@ -527,7 +531,16 @@ impl PeerConnection {
                         && let Ok(parsed) = ssrc_str.parse::<u32>()
                     {
                         ssrc = Some(parsed);
-                        break;
+                    } else if attr.key == "simulcast"
+                        && let Some(val) = &attr.value
+                    {
+                        simulcast = crate::sdp::Simulcast::parse(val);
+                    } else if attr.key == "rid"
+                        && let Some(val) = &attr.value
+                    {
+                        if let Some(rid) = crate::sdp::Rid::parse(val) {
+                            rids.push(rid);
+                        }
                     }
                 }
 
@@ -540,6 +553,18 @@ impl PeerConnection {
                             {
                                 if let Some(rx) = t.receiver.lock().unwrap().as_ref() {
                                     rx.set_ssrc(ssrc_val);
+
+                                    // Handle Simulcast
+                                    if let Some(sim) = &simulcast {
+                                        // For Offer, we look at 'send' direction (remote sends to us)
+                                        for rid_id in &sim.send {
+                                            // Check if we have this RID in rids list
+                                            // We just add the track.
+                                            // Note: We don't have SSRC for this RID yet unless signaled via a=ssrc-group or similar,
+                                            // or we rely on RID header extension.
+                                            let _ = rx.add_simulcast_track(rid_id.clone());
+                                        }
+                                    }
                                 }
                                 break;
                             }
@@ -552,6 +577,14 @@ impl PeerConnection {
 
                     let receiver_ssrc = ssrc.unwrap_or_else(|| 2000 + transceivers.len() as u32);
                     let receiver = Arc::new(RtpReceiver::new(kind, receiver_ssrc));
+
+                    // Handle Simulcast for new transceiver
+                    if let Some(sim) = &simulcast {
+                        for rid_id in &sim.send {
+                            let _ = receiver.add_simulcast_track(rid_id.clone());
+                        }
+                    }
+
                     *t.receiver.lock().unwrap() = Some(receiver);
 
                     transceivers.push(t.clone());
@@ -596,6 +629,57 @@ impl PeerConnection {
 
         let mut remote = self.inner.remote_description.lock().unwrap();
         *remote = Some(desc);
+
+        // Update RtpTransport with RID extension ID if it exists
+        if let Some(transport) = self.inner.rtp_transport.lock().unwrap().as_ref() {
+            let desc = remote.as_ref().unwrap();
+            let mut rid_id = None;
+            // Check session level
+            for attr in &desc.session.attributes {
+                if attr.key == "extmap" {
+                    if let Some(val) = &attr.value {
+                        if val.contains("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id") {
+                            if let Some(first_part) = val.split_whitespace().next() {
+                                let id_str = first_part.split('/').next().unwrap_or(first_part);
+                                if let Ok(id) = id_str.parse::<u8>() {
+                                    rid_id = Some(id);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Check media level if not found
+            if rid_id.is_none() {
+                for section in &desc.media_sections {
+                    for attr in &section.attributes {
+                        if attr.key == "extmap" {
+                            if let Some(val) = &attr.value {
+                                if val.contains("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id") {
+                                    if let Some(first_part) = val.split_whitespace().next() {
+                                        let id_str =
+                                            first_part.split('/').next().unwrap_or(first_part);
+                                        if let Ok(id) = id_str.parse::<u8>() {
+                                            rid_id = Some(id);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if rid_id.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            if let Some(id) = rid_id {
+                transport.set_rid_extension_id(id);
+            }
+        }
+
         Ok(())
     }
 
@@ -657,6 +741,60 @@ impl PeerConnection {
             .await;
 
         let rtp_transport = Arc::new(RtpTransport::new(ice_conn.clone()));
+
+        // Extract RID extension ID from remote description
+        {
+            let remote_desc = self.inner.remote_description.lock().unwrap();
+            if let Some(desc) = &*remote_desc {
+                let mut rid_id = None;
+                // Check session level
+                for attr in &desc.session.attributes {
+                    if attr.key == "extmap" {
+                        if let Some(val) = &attr.value {
+                            if val.contains("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id") {
+                                if let Some(first_part) = val.split_whitespace().next() {
+                                    let id_str = first_part.split('/').next().unwrap_or(first_part);
+                                    if let Ok(id) = id_str.parse::<u8>() {
+                                        rid_id = Some(id);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Check media level if not found
+                if rid_id.is_none() {
+                    for section in &desc.media_sections {
+                        for attr in &section.attributes {
+                            if attr.key == "extmap" {
+                                if let Some(val) = &attr.value {
+                                    if val.contains("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id")
+                                    {
+                                        if let Some(first_part) = val.split_whitespace().next() {
+                                            let id_str =
+                                                first_part.split('/').next().unwrap_or(first_part);
+                                            if let Ok(id) = id_str.parse::<u8>() {
+                                                rid_id = Some(id);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if rid_id.is_some() {
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(id) = rid_id {
+                    rtp_transport.set_rid_extension_id(id);
+                }
+            }
+        }
+
         {
             let mut rx = ice_conn.rtp_receiver.write().unwrap();
             *rx = Some(Arc::downgrade(&rtp_transport)
@@ -685,6 +823,7 @@ impl PeerConnection {
                     if let Some(sender) = &sender_arc {
                         receiver.set_feedback_ssrc(sender.ssrc());
                     }
+                    receiver.clone().start_feedback_loop();
                 }
             }
             return Ok(Box::pin(async {}));
@@ -749,6 +888,7 @@ impl PeerConnection {
             let state = state_rx.borrow().clone();
             match state {
                 crate::transports::dtls::DtlsState::Connected(_, profile_opt) => {
+                    println!("Negotiated SRTP Profile ID: {:?}", profile_opt);
                     // Setup SRTP
                     // RFC 5764:
                     // label = "EXTRACTOR-dtls_srtp"
@@ -817,6 +957,7 @@ impl PeerConnection {
                                         if let Some(sender) = &sender_arc {
                                             receiver.set_feedback_ssrc(sender.ssrc());
                                         }
+                                        receiver.clone().start_feedback_loop();
                                     }
                                 }
                             }
@@ -1561,6 +1702,65 @@ impl PeerConnectionInner {
             MediaKind::Video => apply_video_capabilities(section, &self.config),
             MediaKind::Application => apply_application_capabilities(section, &self.config),
         }
+
+        // Add extmap for Video
+        if kind == MediaKind::Video {
+            let mut rid_id = None;
+            let mut repaired_rid_id = None;
+
+            if sdp_type == SdpType::Answer {
+                let remote = self.remote_description.lock().unwrap();
+                if let Some(desc) = &*remote {
+                    // Find remote section with same MID
+                    if let Some(remote_section) =
+                        desc.media_sections.iter().find(|s| s.mid == section.mid)
+                    {
+                        for attr in &remote_section.attributes {
+                            if attr.key == "extmap" {
+                                if let Some(val) = &attr.value {
+                                    if val.contains("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id")
+                                    {
+                                        if let Some(id_str) = val.split_whitespace().next() {
+                                            rid_id = Some(id_str.to_string());
+                                        }
+                                    } else if val
+                                        .contains("urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id")
+                                    {
+                                        if let Some(id_str) = val.split_whitespace().next() {
+                                            repaired_rid_id = Some(id_str.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Offer: Use default IDs
+                rid_id = Some("1".to_string());
+                repaired_rid_id = Some("2".to_string());
+            }
+
+            if let Some(id) = rid_id {
+                section.attributes.push(Attribute::new(
+                    "extmap",
+                    Some(format!(
+                        "{} urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id",
+                        id
+                    )),
+                ));
+            }
+            if let Some(id) = repaired_rid_id {
+                section.attributes.push(Attribute::new(
+                    "extmap",
+                    Some(format!(
+                        "{} urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id",
+                        id
+                    )),
+                ));
+            }
+        }
+
         if self.config.transport_mode != TransportMode::Rtp {
             self.add_dtls_attributes(section, sdp_type);
         }
@@ -1855,6 +2055,7 @@ pub struct RtpSender {
     cname: Arc<str>,
     rtcp_tx: broadcast::Sender<RtcpPacket>,
     stop_tx: Arc<tokio::sync::Notify>,
+    next_sequence_number: Arc<AtomicU16>,
 }
 
 impl RtpSender {
@@ -1886,6 +2087,7 @@ impl RtpSender {
             cname,
             rtcp_tx,
             stop_tx: Arc::new(tokio::sync::Notify::new()),
+            next_sequence_number: Arc::new(AtomicU16::new(random_u32() as u16)),
         }
     }
 
@@ -1923,6 +2125,7 @@ impl RtpSender {
         let ssrc = self.ssrc;
         let params = self.params.lock().unwrap().clone();
         let stop_rx = self.stop_tx.clone();
+        let next_seq = self.next_sequence_number.clone();
         tokio::spawn(async move {
             let mut sequence_number = 0u16;
             loop {
@@ -1931,12 +2134,14 @@ impl RtpSender {
                     res = track.recv() => {
                         match res {
                             Ok(sample) => {
-                                let packet = sample.into_rtp_packet(
+                                let mut packet = sample.into_rtp_packet(
                                     ssrc,
                                     params.clock_rate,
                                     params.payload_type,
                                     &mut sequence_number,
                                 );
+                                // Rewrite sequence number
+                                packet.header.sequence_number = next_seq.fetch_add(1, Ordering::Relaxed);
                                 if let Err(e) = transport.send_rtp(&packet).await {
                                     debug!("Failed to send RTP: {}", e);
                                 }
@@ -1964,6 +2169,8 @@ pub struct RtpReceiver {
     transport: Mutex<Option<Arc<RtpTransport>>>,
     rtcp_feedback_ssrc: Mutex<Option<u32>>,
     fir_seq: AtomicU8,
+    feedback_rx: Mutex<Option<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
+    simulcast_tracks: Mutex<HashMap<String, (Arc<SampleStreamSource>, Arc<SampleStreamTrack>)>>,
 }
 
 impl RtpReceiver {
@@ -1973,7 +2180,7 @@ impl RtpReceiver {
             MediaKind::Video => crate::media::frame::MediaKind::Video,
             _ => crate::media::frame::MediaKind::Audio, // Fallback or panic
         };
-        let (source, track) = sample_track(media_kind, 100);
+        let (source, track, feedback_rx) = sample_track(media_kind, 100);
 
         let params = match kind {
             MediaKind::Audio => RtpCodecParameters {
@@ -1997,11 +2204,87 @@ impl RtpReceiver {
             transport: Mutex::new(None),
             rtcp_feedback_ssrc: Mutex::new(None),
             fir_seq: AtomicU8::new(0),
+            feedback_rx: Mutex::new(Some(feedback_rx)),
+            simulcast_tracks: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn add_simulcast_track(&self, rid: String) -> Arc<SampleStreamTrack> {
+        let (source, track, _) = sample_track(self.track.kind(), 100);
+        let source = Arc::new(source);
+        self.simulcast_tracks
+            .lock()
+            .unwrap()
+            .insert(rid.clone(), (source.clone(), track.clone()));
+
+        // If transport is already set, register listener for this RID
+        let transport = self.transport.lock().unwrap().clone();
+        if let Some(transport) = transport {
+            let (tx, mut rx) = mpsc::channel(100);
+            transport.register_rid_listener(rid, tx);
+            let source = source.clone();
+            let params = self.params.lock().unwrap().clone();
+            tokio::spawn(async move {
+                while let Some(packet) = rx.recv().await {
+                    let sample = crate::media::frame::MediaSample::from_rtp_packet(
+                        packet,
+                        source.kind(),
+                        params.clock_rate,
+                        params.channels,
+                    );
+                    if let Err(_) = source.send(sample).await {
+                        break;
+                    }
+                }
+            });
+        }
+
+        track
+    }
+
+    pub fn start_feedback_loop(self: Arc<Self>) {
+        let mut rx_guard = self.feedback_rx.lock().unwrap();
+        if let Some(mut rx) = rx_guard.take() {
+            let this = self.clone();
+            tokio::spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        crate::media::track::FeedbackEvent::RequestKeyFrame => {
+                            let transport = {
+                                let guard = this.transport.lock().unwrap();
+                                guard.clone()
+                            };
+                            if let Some(transport) = transport {
+                                let ssrc = *this.ssrc.lock().unwrap();
+                                let sender_ssrc = *this.rtcp_feedback_ssrc.lock().unwrap();
+                                let pli = crate::rtp::PictureLossIndication {
+                                    sender_ssrc: sender_ssrc.unwrap_or(0),
+                                    media_ssrc: ssrc,
+                                };
+                                let packet = crate::rtp::RtcpPacket::PictureLossIndication(pli);
+                                if let Err(e) = transport.send_rtcp(&[packet]).await {
+                                    warn!("Failed to send PLI: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
         }
     }
 
     pub fn track(&self) -> Arc<SampleStreamTrack> {
         self.track.clone()
+    }
+
+    pub fn simulcast_track(&self, rid: &str) -> Option<Arc<SampleStreamTrack>> {
+        let tracks = self.simulcast_tracks.lock().unwrap();
+        tracks.get(rid).map(|(_, track)| track.clone())
+    }
+
+    pub fn get_simulcast_rids(&self) -> Vec<String> {
+        let tracks = self.simulcast_tracks.lock().unwrap();
+        tracks.keys().cloned().collect()
     }
 
     pub fn set_params(&self, params: RtpCodecParameters) {
@@ -2033,6 +2316,28 @@ impl RtpReceiver {
                 }
             }
         });
+
+        // Register simulcast listeners
+        let simulcast_tracks = self.simulcast_tracks.lock().unwrap().clone();
+        for (rid, (source, _)) in simulcast_tracks {
+            let (tx, mut rx) = mpsc::channel(100);
+            transport.register_rid_listener(rid, tx);
+            let source = source.clone();
+            let params = params.clone();
+            tokio::spawn(async move {
+                while let Some(packet) = rx.recv().await {
+                    let sample = crate::media::frame::MediaSample::from_rtp_packet(
+                        packet,
+                        source.kind(),
+                        params.clock_rate,
+                        params.channels,
+                    );
+                    if let Err(_) = source.send(sample).await {
+                        break;
+                    }
+                }
+            });
+        }
     }
 
     pub fn set_feedback_ssrc(&self, ssrc: u32) {
@@ -2189,6 +2494,42 @@ mod tests {
                     .map(|v| v == expected_port)
                     .unwrap_or(false)
         }));
+    }
+
+    #[tokio::test]
+    async fn test_simulcast_setup() {
+        use crate::{SdpType, SessionDescription};
+        let pc = PeerConnection::new(RtcConfiguration::default());
+
+        // Create SDP with Simulcast
+        // We need to include extmap for RID
+        let sdp_str = "v=0\r\n\
+                       o=- 123456 0 IN IP4 127.0.0.1\r\n\
+                       s=-\r\n\
+                       t=0 0\r\n\
+                       a=extmap:3 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id\r\n\
+                       c=IN IP4 127.0.0.1\r\n\
+                       m=video 9 RTP/SAVPF 96\r\n\
+                       a=rtpmap:96 VP8/90000\r\n\
+                       a=rid:hi send\r\n\
+                       a=rid:mid send\r\n\
+                       a=rid:lo send\r\n\
+                       a=simulcast:send hi;mid;lo\r\n";
+
+        let desc = SessionDescription::parse(SdpType::Offer, sdp_str).unwrap();
+        pc.set_remote_description(desc).await.unwrap();
+
+        let transceivers = pc.inner.transceivers.lock().unwrap();
+        assert_eq!(transceivers.len(), 1);
+        let t = &transceivers[0];
+        let rx = t.receiver.lock().unwrap().as_ref().unwrap().clone();
+
+        // Check simulcast tracks
+        let simulcast_tracks = rx.simulcast_tracks.lock().unwrap();
+        assert!(simulcast_tracks.contains_key("hi"));
+        assert!(simulcast_tracks.contains_key("mid"));
+        assert!(simulcast_tracks.contains_key("lo"));
+        assert_eq!(simulcast_tracks.len(), 3);
     }
 
     #[tokio::test]

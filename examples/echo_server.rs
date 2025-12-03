@@ -192,7 +192,7 @@ async fn start_echo(pc: PeerConnection, vp8_pt: u8) {
         };
 
         let incoming_track = receiver.track();
-        let (sample_source, outgoing_track) = media::sample_track(MediaStreamKind::Video, 120);
+        let (sample_source, outgoing_track, _) = media::sample_track(MediaStreamKind::Video, 120);
 
         let ssrc = 5000 + transceiver.id() as u32;
         let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
@@ -342,7 +342,7 @@ async fn start_video_playback(pc: PeerConnection, vp8_pt: u8) {
         }
         video_playing = true;
 
-        let (sample_source, outgoing_track) = media::sample_track(MediaStreamKind::Video, 120);
+        let (sample_source, outgoing_track, _) = media::sample_track(MediaStreamKind::Video, 120);
 
         let ssrc = 5000 + transceiver.id() as u32;
         let sender = Arc::new(rustrtc::peer_connection::RtpSender::new(
