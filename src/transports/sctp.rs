@@ -1217,29 +1217,26 @@ impl SctpInner {
         };
 
         // Flow Control Check
-        loop {
-            let flight = self.flight_size.load(Ordering::SeqCst);
-            let cwnd = self.cwnd.load(Ordering::SeqCst);
-            let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
-
-            // RFC 4960: min(cwnd, rwnd)
-            // Note: rwnd can be 0 if receiver is full.
-            // We must allow at least 1 packet if flight is 0 to avoid deadlock (Zero Window Probe),
-            // but for simplicity we just wait.
-            let effective_window = cwnd.min(rwnd);
-
-            if flight >= effective_window {
-                // Wait for window to open
-                self.flow_control_notify.notified().await;
-            } else {
-                break;
-            }
-        }
-
+        // We loop to send data in chunks that fit within the congestion window.
+        // This prevents bursting large messages and flooding the network.
         let total_len = data.len();
 
         if total_len == 0 {
             // Send empty packet (unfragmented)
+            // Wait for window space for at least 1 byte/packet
+            loop {
+                let flight = self.flight_size.load(Ordering::SeqCst);
+                let cwnd = self.cwnd.load(Ordering::SeqCst);
+                let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
+                let effective_window = cwnd.min(rwnd);
+
+                if flight >= effective_window {
+                    self.flow_control_notify.notified().await;
+                } else {
+                    break;
+                }
+            }
+
             let tsn = self.next_tsn.fetch_add(1, Ordering::SeqCst);
             let packet = self.create_packet(channel_id, ppid, data, ssn, 0x03, tsn);
             {
@@ -1259,61 +1256,97 @@ impl SctpInner {
             return self.dtls_transport.send(packet).await;
         }
 
-        let mut chunks = Vec::new();
         let mut offset = 0;
 
         while offset < total_len {
-            let remaining = total_len - offset;
-            let chunk_size = std::cmp::min(remaining, max_payload_size);
-            let chunk_data = &data[offset..offset + chunk_size];
+            // 1. Wait for window space
+            let allowed_bytes;
+            loop {
+                let flight = self.flight_size.load(Ordering::SeqCst);
+                let cwnd = self.cwnd.load(Ordering::SeqCst);
+                let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
+                let effective_window = cwnd.min(rwnd);
 
-            let flags = if offset == 0 {
-                if remaining <= max_payload_size {
-                    0x03 // B=1, E=1 (Unfragmented)
+                if flight >= effective_window {
+                    self.flow_control_notify.notified().await;
                 } else {
-                    0x02 // B=1, E=0 (First)
+                    let mut bytes = effective_window - flight;
+                    if bytes == 0 {
+                        // Should not happen if flight < effective_window, but safety check
+                        bytes = max_payload_size;
+                    }
+                    allowed_bytes = bytes;
+                    break;
                 }
-            } else if offset + chunk_size >= total_len {
-                0x01 // B=0, E=1 (Last)
-            } else {
-                0x00 // B=0, E=0 (Middle)
-            };
+            }
 
-            let tsn = self.next_tsn.fetch_add(1, Ordering::SeqCst);
-            let packet = self.create_packet(channel_id, ppid, chunk_data, ssn, flags, tsn);
-            chunks.push((tsn, packet));
+            // 2. Create a batch of chunks that fits in the window
+            let mut chunks = Vec::new();
+            let mut batch_len = 0;
 
-            offset += chunk_size;
-        }
+            while offset < total_len {
+                let remaining = total_len - offset;
+                let chunk_size = std::cmp::min(remaining, max_payload_size);
 
-        // Batch insert into sent_queue
-        {
-            let mut queue = self.sent_queue.lock().unwrap();
-            let now = Instant::now();
-            let mut added_bytes = 0;
-            let was_empty = queue.is_empty();
+                // Check if we have room (approximate check before expensive create_packet)
+                // Header overhead is ~28 bytes.
+                if !chunks.is_empty() && batch_len + chunk_size + 28 > allowed_bytes {
+                    break;
+                }
 
-            for (tsn, packet) in &chunks {
-                let record = ChunkRecord {
-                    payload: packet.clone(),
-                    sent_time: now,
-                    transmit_count: 0,
+                let flags = if offset == 0 {
+                    if remaining <= max_payload_size {
+                        0x03 // B=1, E=1 (Unfragmented)
+                    } else {
+                        0x02 // B=1, E=0 (First)
+                    }
+                } else if offset + chunk_size >= total_len {
+                    0x01 // B=0, E=1 (Last)
+                } else {
+                    0x00 // B=0, E=0 (Middle)
                 };
-                queue.insert(*tsn, record);
-                added_bytes += packet.len();
+
+                let tsn = self.next_tsn.fetch_add(1, Ordering::SeqCst);
+                let chunk_data = &data[offset..offset + chunk_size];
+                let packet = self.create_packet(channel_id, ppid, chunk_data, ssn, flags, tsn);
+
+                let pkt_len = packet.len();
+                chunks.push((tsn, packet));
+                batch_len += pkt_len;
+                offset += chunk_size;
+
+                if batch_len >= allowed_bytes {
+                    break;
+                }
             }
 
-            self.flight_size.fetch_add(added_bytes, Ordering::SeqCst);
+            // 3. Batch insert into sent_queue
+            {
+                let mut queue = self.sent_queue.lock().unwrap();
+                let now = Instant::now();
+                let was_empty = queue.is_empty();
 
-            // Only notify timer if the queue was empty (head changed)
-            if was_empty {
-                self.timer_notify.notify_one();
+                for (tsn, packet) in &chunks {
+                    let record = ChunkRecord {
+                        payload: packet.clone(),
+                        sent_time: now,
+                        transmit_count: 0,
+                    };
+                    queue.insert(*tsn, record);
+                }
+
+                self.flight_size.fetch_add(batch_len, Ordering::SeqCst);
+
+                // Only notify timer if the queue was empty (head changed)
+                if was_empty {
+                    self.timer_notify.notify_one();
+                }
             }
-        }
 
-        // Batch send
-        for (_, packet) in chunks {
-            self.dtls_transport.send(packet).await?;
+            // 4. Batch send
+            for (_, packet) in chunks {
+                self.dtls_transport.send(packet).await?;
+            }
         }
 
         Ok(())
