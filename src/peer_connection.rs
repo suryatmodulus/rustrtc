@@ -181,6 +181,7 @@ impl PeerConnection {
         let ice_transport_gathering = ice_transport.clone();
         let ice_gathering_state_tx = pc.inner.ice_gathering_state.clone();
         let inner_weak_gathering = inner_weak.clone();
+        let need_run_dtls_loop = pc.inner.config.transport_mode == TransportMode::WebRtc;
 
         tokio::spawn(async move {
             let gathering_loop = run_gathering_loop(
@@ -189,12 +190,17 @@ impl PeerConnection {
                 inner_weak_gathering,
             );
 
-            let dtls_loop = run_ice_dtls_loop(
-                ice_transport,
-                ice_connection_state_tx,
-                dtls_role_rx,
-                inner_weak,
-            );
+            let dtls_loop = async {
+                if need_run_dtls_loop {
+                    run_ice_dtls_loop(
+                        ice_transport,
+                        ice_connection_state_tx,
+                        dtls_role_rx,
+                        inner_weak,
+                    )
+                    .await
+                }
+            };
 
             tokio::join!(gathering_loop, dtls_loop, ice_runner);
         });
@@ -1356,6 +1362,22 @@ async fn run_gathering_loop(
                         }
                         true
                     } else {
+                        let candidates = ice_transport.local_candidates();
+                        if let Some(candidate) = candidates.first() {
+                            let mut local_guard = inner.local_description.lock().unwrap();
+                            if let Some(desc) = local_guard.as_mut() {
+                                for media in &mut desc.media_sections {
+                                    media.port = candidate.address.port();
+                                    let ip_str = candidate.address.ip().to_string();
+                                    let ip_ver = if candidate.address.is_ipv4() {
+                                        "IP4"
+                                    } else {
+                                        "IP6"
+                                    };
+                                    media.connection = Some(format!("IN {} {}", ip_ver, ip_str));
+                                }
+                            }
+                        }
                         true
                     }
                 };
