@@ -214,7 +214,10 @@ impl PacketReceiver for RtpTransport {
                     // Fallback to SSRC listener
                     if listener.is_none() {
                         let listeners = self.listeners.lock().unwrap();
-                        listener = listeners.get(&ssrc).cloned();
+                        listener = listeners
+                            .get(&ssrc)
+                            .or_else(|| listeners.get(&2000))
+                            .cloned();
                     }
 
                     if let Some(tx) = listener {
