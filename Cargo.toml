@@ -1,6 +1,6 @@
 [package]
 name = "rustrtc"
-version = "0.2.17"
+version = "0.2.18"
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>"]
 repository = "https://github.com/restsend/rustrtc"
@@ -48,9 +48,9 @@ tower = { version = "0.5", features = ["util", "timeout"] }
 tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
 turn = "0.11.0"
 webrtc = "0.14.0"
+reqwest = { version = "0.12", features = ["json"] }
 webrtc-util = "0.12.0"
 env_logger = "0.11.8"
 dtls = "0.13.0"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 indicatif = "0.18.3"
-reqwest = { version = "0.12.24", features = ["json"] }
