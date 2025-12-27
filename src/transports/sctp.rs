@@ -1,7 +1,7 @@
+use crate::RtcConfiguration;
 pub use crate::transports::datachannel::*;
 use crate::transports::dtls::{DtlsState, DtlsTransport};
 use crate::transports::ice::stun::random_u32;
-use crate::RtcConfiguration;
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::collections::BTreeMap;
@@ -164,6 +164,10 @@ struct SctpInner {
 
     // Association Retransmission Limit
     max_association_retransmits: u32,
+
+    // Association Error Counter
+    association_error_count: AtomicU32,
+    heartbeat_sent_time: Mutex<Option<Instant>>,
 
     // Receiver Window Tracking
     used_rwnd: AtomicUsize,
@@ -396,6 +400,8 @@ impl SctpTransport {
             peer_reconfig_request_sn: AtomicU32::new(u32::MAX), // Initial value to allow 0
             fast_recovery_exit_tsn: AtomicU32::new(0),
             max_association_retransmits: config.sctp_max_association_retransmits,
+            association_error_count: AtomicU32::new(0),
+            heartbeat_sent_time: Mutex::new(None),
             used_rwnd: AtomicUsize::new(0),
             packets_received: AtomicU64::new(0),
             cached_rto_timeout: Mutex::new(None),
@@ -688,16 +694,12 @@ impl SctpInner {
                             abandoned_tsn = Some(*tsn);
                         }
                     } else {
-                        // Check for association-wide retransmission limit
-                        if record.transmit_count >= self.max_association_retransmits && self.max_association_retransmits > 0 {
-                            warn!("SCTP Association retransmission limit reached ({}), closing", self.max_association_retransmits);
-                            self.set_state(SctpState::Closed);
-                            return Ok(());
-                        }
-
                         // RFC 4960 Section 6.3.3: Retransmit only the earliest outstanding DATA chunks
                         // that fit into a single packet of size MTU.
-                        let current_len: usize = to_retransmit.iter().map(|(_, p): &(u32, Bytes)| p.len()).sum();
+                        let current_len: usize = to_retransmit
+                            .iter()
+                            .map(|(_, p): &(u32, Bytes)| p.len())
+                            .sum();
                         if current_len + record.payload.len() < DEFAULT_MAX_PAYLOAD_SIZE {
                             to_retransmit.push((*tsn, record.payload.clone()));
                             record.transmit_count += 1;
@@ -715,6 +717,19 @@ impl SctpInner {
         }
 
         if !to_retransmit.is_empty() {
+            // Increment association error count
+            let error_count = self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
+            if error_count >= self.max_association_retransmits
+                && self.max_association_retransmits > 0
+            {
+                warn!(
+                    "SCTP Association retransmission limit reached ({}), closing",
+                    self.max_association_retransmits
+                );
+                self.set_state(SctpState::Closed);
+                return Ok(());
+            }
+
             // Backoff RTO once per timer tick
             let mut rto_state = self.rto_state.lock().unwrap();
             rto_state.backoff();
@@ -794,6 +809,7 @@ impl SctpInner {
     }
 
     async fn handle_packet(&self, packet: Bytes) -> Result<()> {
+        let now = Instant::now();
         if packet.len() < SCTP_COMMON_HEADER_SIZE {
             return Ok(());
         }
@@ -856,6 +872,13 @@ impl SctpInner {
                 CT_HEARTBEAT => self.handle_heartbeat(chunk_value).await?,
                 CT_HEARTBEAT_ACK => {
                     trace!("SCTP HEARTBEAT ACK received");
+                    self.association_error_count.store(0, Ordering::SeqCst);
+                    let mut sent_time = self.heartbeat_sent_time.lock().unwrap();
+                    if let Some(start) = *sent_time {
+                        let rtt = now.duration_since(start).as_secs_f64();
+                        self.update_rto(rtt);
+                        *sent_time = None;
+                    }
                 }
                 CT_FORWARD_TSN => self.handle_forward_tsn(chunk_value).await?,
                 CT_RECONFIG => self.handle_reconfig(chunk_value).await?,
@@ -1058,6 +1081,10 @@ impl SctpInner {
                 let mut sent_queue = self.sent_queue.lock().unwrap();
                 apply_sack_to_sent_queue(&mut *sent_queue, cumulative_tsn_ack, &gap_blocks, now)
             };
+
+            if outcome.bytes_acked_by_cum_tsn > 0 || !outcome.rtt_samples.is_empty() {
+                self.association_error_count.store(0, Ordering::SeqCst);
+            }
 
             for rtt in outcome.rtt_samples {
                 self.update_rto(rtt);
@@ -1386,6 +1413,28 @@ impl SctpInner {
     }
 
     async fn send_heartbeat(&self) -> Result<()> {
+        let now = Instant::now();
+        {
+            let mut sent_time = self.heartbeat_sent_time.lock().unwrap();
+            if sent_time.is_some() {
+                // Heartbeat already in flight, increment error count
+                let error_count = self.association_error_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if error_count >= self.max_association_retransmits
+                    && self.max_association_retransmits > 0
+                {
+                    warn!(
+                        "SCTP Association heartbeat timeout limit reached ({}), closing",
+                        self.max_association_retransmits
+                    );
+                    self.set_state(SctpState::Closed);
+                    return Ok(());
+                }
+                // Backoff RTO
+                self.rto_state.lock().unwrap().backoff();
+            }
+            *sent_time = Some(now);
+        }
+
         let mut buf = BytesMut::with_capacity(8);
         buf.put_u16(1); // Heartbeat Info Parameter Type
         buf.put_u16(8); // Length
@@ -2350,7 +2399,10 @@ mod tests {
     #[tokio::test]
     async fn test_sctp_association_retransmission_limit() {
         let (socket_tx, _) = tokio::sync::watch::channel(None);
-        let ice_conn = crate::transports::ice::conn::IceConn::new(socket_tx.subscribe(), "127.0.0.1:5000".parse().unwrap());
+        let ice_conn = crate::transports::ice::conn::IceConn::new(
+            socket_tx.subscribe(),
+            "127.0.0.1:5000".parse().unwrap(),
+        );
         let cert = crate::transports::dtls::generate_certificate().unwrap();
         let (dtls, _, _) = DtlsTransport::new(ice_conn, cert, true, 100).await.unwrap();
 
@@ -2391,7 +2443,10 @@ mod tests {
 
         // First timeout: transmit_count becomes 2
         sctp.inner.handle_timeout().await.unwrap();
-        assert_eq!(sctp.inner.state.lock().unwrap().clone(), SctpState::Connecting);
+        assert_eq!(
+            sctp.inner.state.lock().unwrap().clone(),
+            SctpState::Connecting
+        );
 
         // Manually set sent_time back to trigger another timeout
         {

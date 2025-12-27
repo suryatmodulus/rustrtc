@@ -512,12 +512,14 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
                 tokio::time::timeout(Duration::from_secs(10), pc1.wait_for_connected()).await
             {
                 // println!("Timeout waiting for pc1 connection");
+                pb.inc(1);
                 return;
             }
             if let Err(_) =
                 tokio::time::timeout(Duration::from_secs(10), pc2.wait_for_connected()).await
             {
                 // println!("Timeout waiting for pc2 connection");
+                pb.inc(1);
                 return;
             }
 
@@ -595,9 +597,14 @@ async fn run_rustrtc(count: usize) -> (f64, u64, u64) {
             // Sender loop (10 seconds)
             let start_send = Instant::now();
             let duration = Duration::from_secs(10);
+            let mut send_count = 0;
             while start_send.elapsed() < duration {
                 if let Err(_) = pc1.send_data(dc1.id, &data).await {
                     break;
+                }
+                send_count += 1;
+                if send_count % 32 == 0 {
+                    tokio::task::yield_now().await;
                 }
             }
 
@@ -753,11 +760,15 @@ async fn run_webrtc(count: usize) -> (f64, u64, u64) {
 
             let data = bytes::Bytes::from(vec![0u8; 1024]);
             let start_send = Instant::now();
+            let mut send_count = 0;
             while start_send.elapsed() < Duration::from_secs(10) {
                 if let Err(_) = dc1.send(&data).await {
                     break;
                 }
-                // tokio::task::yield_now().await;
+                send_count += 1;
+                if send_count % 32 == 0 {
+                    tokio::task::yield_now().await;
+                }
             }
 
             pc1.close().await.unwrap();

@@ -1,4 +1,4 @@
-use super::IceSocketWrapper;
+use super::{IceSocketWrapper, should_drop_packet};
 use crate::transports::PacketReceiver;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -43,6 +43,9 @@ impl IceConn {
     }
 
     pub async fn send(&self, buf: &[u8]) -> Result<usize> {
+        if should_drop_packet() {
+            return Ok(buf.len());
+        }
         let socket_rx = self.socket_rx.clone();
         let socket_opt = socket_rx.borrow().clone();
 

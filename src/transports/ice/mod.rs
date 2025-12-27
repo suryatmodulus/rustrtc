@@ -23,9 +23,45 @@ use tracing::{debug, instrument, trace, warn};
 use self::stun::{
     StunAttribute, StunClass, StunDecoded, StunMessage, StunMethod, random_bytes, random_u64,
 };
+#[cfg(any(test, feature = "simulator"))]
+use self::stun::random_u32;
 use crate::{IceServer, IceTransportPolicy, RtcConfiguration};
 
 pub(crate) const MAX_STUN_MESSAGE: usize = 1500;
+
+#[cfg(any(test, feature = "simulator"))]
+use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(any(test, feature = "simulator"))]
+static PACKET_LOSS_RATE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+pub(crate) fn should_drop_packet() -> bool {
+    #[cfg(not(any(test, feature = "simulator")))]
+    return false;
+
+    #[cfg(any(test, feature = "simulator"))]
+    {
+        let mut rate = PACKET_LOSS_RATE.load(Ordering::Relaxed);
+        if rate == u32::MAX {
+            rate = std::env::var("RUSTRTC_PACKET_LOSS")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|f| (f * 100.0) as u32)
+                .unwrap_or(0);
+            PACKET_LOSS_RATE.store(rate, Ordering::Relaxed);
+        }
+
+        if rate == 0 {
+            return false;
+        }
+
+        let rand_val = random_u32() % 10000;
+        let drop = rand_val < rate;
+        if drop {
+            trace!("SIMULATOR: Dropping packet (rate={}%)", rate as f64 / 100.0);
+        }
+        drop
+    }
+}
 
 #[derive(Debug)]
 enum IceCommand {
@@ -778,6 +814,9 @@ async fn handle_packet(
     inner: Arc<IceTransportInner>,
     sender: IceSocketWrapper,
 ) {
+    if should_drop_packet() {
+        return;
+    }
     {
         *inner.last_received.lock().unwrap() = Instant::now();
     }

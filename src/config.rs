@@ -255,7 +255,7 @@ impl Default for RtcConfiguration {
             sctp_rto_initial: std::time::Duration::from_secs(1),
             sctp_rto_min: std::time::Duration::from_millis(200),
             sctp_rto_max: std::time::Duration::from_secs(60),
-            sctp_max_association_retransmits: 10,
+            sctp_max_association_retransmits: 20,
             dtls_buffer_size: 100,
         }
     }

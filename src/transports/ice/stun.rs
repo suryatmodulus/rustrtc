@@ -442,43 +442,20 @@ fn crc32(data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
-use std::fs::File;
-use std::io::{Read, Result as IoResult};
-use std::time::{SystemTime, UNIX_EPOCH};
+use rand::{Rng, RngCore};
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
-    if fill_random_from_urandom(&mut buf).is_err() {
-        fallback_random(&mut buf);
-    }
+    rand::thread_rng().fill_bytes(&mut buf);
     buf
 }
 
 pub fn random_u64() -> u64 {
-    u64::from_be_bytes(random_bytes::<8>())
+    rand::thread_rng().r#gen()
 }
 
 pub fn random_u32() -> u32 {
-    u32::from_be_bytes(random_bytes::<4>())
-}
-
-fn fill_random_from_urandom(buf: &mut [u8]) -> IoResult<()> {
-    let mut file = File::open("/dev/urandom")?;
-    file.read_exact(buf)
-}
-
-fn fallback_random(buf: &mut [u8]) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let mut seed = now as u64;
-    for byte in buf {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        *byte = (seed & 0xFF) as u8;
-    }
+    rand::thread_rng().r#gen()
 }
 
 #[cfg(test)]
