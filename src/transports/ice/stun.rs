@@ -446,16 +446,16 @@ use rand::{Rng, RngCore};
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     buf
 }
 
 pub fn random_u64() -> u64 {
-    rand::thread_rng().r#gen()
+    rand::rng().random()
 }
 
 pub fn random_u32() -> u32 {
-    rand::thread_rng().r#gen()
+    rand::rng().random()
 }
 
 #[cfg(test)]

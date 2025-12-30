@@ -17,6 +17,7 @@ pub struct RtpTransport {
     rtcp_listener: Mutex<Option<mpsc::Sender<Vec<RtcpPacket>>>>,
     rid_listeners: Mutex<HashMap<String, mpsc::Sender<RtpPacket>>>,
     rid_extension_id: Mutex<Option<u8>>,
+    abs_send_time_extension_id: Mutex<Option<u8>>,
     srtp_required: bool,
 }
 
@@ -29,6 +30,7 @@ impl RtpTransport {
             rtcp_listener: Mutex::new(None),
             rid_listeners: Mutex::new(HashMap::new()),
             rid_extension_id: Mutex::new(None),
+            abs_send_time_extension_id: Mutex::new(None),
             srtp_required,
         }
     }
@@ -61,6 +63,10 @@ impl RtpTransport {
         *self.rid_extension_id.lock().unwrap() = Some(id);
     }
 
+    pub fn set_abs_send_time_extension_id(&self, id: u8) {
+        *self.abs_send_time_extension_id.lock().unwrap() = Some(id);
+    }
+
     pub fn register_rtcp_listener(&self, tx: mpsc::Sender<Vec<RtcpPacket>>) {
         let mut listener = self.rtcp_listener.lock().unwrap();
         *listener = Some(tx);
@@ -72,6 +78,15 @@ impl RtpTransport {
             if let Some(session) = &*session_guard {
                 let mut srtp = session.lock().unwrap();
                 let mut packet = RtpPacket::parse(buf)?;
+
+                // Inject abs-send-time if enabled
+                if let Some(id) = *self.abs_send_time_extension_id.lock().unwrap() {
+                    let abs_send_time =
+                        crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
+                    let data = abs_send_time.to_be_bytes()[1..4].to_vec();
+                    packet.header.set_extension(id, &data)?;
+                }
+
                 srtp.protect_rtp(&mut packet)?;
                 packet.marshal()?
             } else {
@@ -86,6 +101,14 @@ impl RtpTransport {
 
     pub async fn send_rtp(&self, packet: &RtpPacket) -> Result<usize> {
         let mut packet = packet.clone();
+
+        // Inject abs-send-time if enabled
+        if let Some(id) = *self.abs_send_time_extension_id.lock().unwrap() {
+            let abs_send_time = crate::rtp::calculate_abs_send_time(std::time::SystemTime::now());
+            let data = abs_send_time.to_be_bytes()[1..4].to_vec();
+            packet.header.set_extension(id, &data)?;
+        }
+
         let protected = {
             let session_guard = self.srtp_session.lock().unwrap();
             if let Some(session) = &*session_guard {

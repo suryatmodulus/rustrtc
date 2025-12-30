@@ -10,16 +10,6 @@ pub enum MediaKind {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub enum AudioSampleFormat {
-    S16,
-    S32,
-    F32,
-    F64,
-    #[default]
-    Unspecified,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum VideoPixelFormat {
     I420,
     Nv12,
@@ -35,7 +25,6 @@ pub struct AudioFrame {
     pub sample_rate: u32,
     pub channels: u8,
     pub samples: u32,
-    pub format: AudioSampleFormat,
     pub data: Bytes,
     pub sequence_number: Option<u16>,
     pub payload_type: Option<u8>,
@@ -48,7 +37,6 @@ impl Default for AudioFrame {
             sample_rate: 48_000,
             channels: 2,
             samples: 0,
-            format: AudioSampleFormat::default(),
             data: Bytes::new(),
             sequence_number: None,
             payload_type: None,
@@ -164,7 +152,6 @@ impl MediaSample {
                     sample_rate: clock_rate,
                     channels,
                     samples,
-                    format: AudioSampleFormat::S16,
                     data,
                     sequence_number: Some(packet.header.sequence_number),
                     payload_type: Some(packet.header.payload_type),

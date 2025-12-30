@@ -6,6 +6,8 @@ use std::{
     str::FromStr,
 };
 
+pub const ABS_SEND_TIME_URI: &str = "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SdpType {
@@ -584,6 +586,24 @@ impl MediaSection {
             .filter(|a| a.key == "crypto")
             .filter_map(|a| a.value.as_ref().and_then(|v| CryptoAttribute::parse(v)))
             .collect()
+    }
+
+    pub fn get_extmap_id(&self, uri: &str) -> Option<u8> {
+        for attr in &self.attributes {
+            if attr.key == "extmap" {
+                if let Some(val) = &attr.value {
+                    let mut parts = val.split_whitespace();
+                    if let Some(id_str) = parts.next() {
+                        if let Some(attr_uri) = parts.next() {
+                            if attr_uri == uri {
+                                return id_str.parse().ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn apply_config(&mut self, config: &RtcConfiguration) {

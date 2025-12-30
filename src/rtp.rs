@@ -1,5 +1,6 @@
 use crate::errors::{RtpError, RtpResult};
 use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
 
 const RTP_VERSION: u8 = 2;
 pub const RTCP_SR: u8 = 200;
@@ -109,6 +110,72 @@ impl RtpHeader {
             }
         }
         None
+    }
+
+    pub fn set_extension(&mut self, id: u8, data: &[u8]) -> RtpResult<()> {
+        if id == 0 || id >= 15 {
+            return Err(RtpError::InvalidHeader(
+                "invalid extension id for one-byte header",
+            ));
+        }
+        if data.len() > 16 || data.is_empty() {
+            return Err(RtpError::InvalidHeader("invalid extension data length"));
+        }
+
+        let mut ext = self
+            .extension
+            .clone()
+            .unwrap_or_else(|| RtpHeaderExtension::new(0xBEDE, Vec::new()));
+
+        if ext.profile != 0xBEDE {
+            // For now, we only support modifying 0xBEDE
+            return Err(RtpError::InvalidHeader(
+                "unsupported extension profile for modification",
+            ));
+        }
+
+        let mut new_data = Vec::new();
+        let mut found = false;
+        let mut offset = 0;
+
+        while offset < ext.data.len() {
+            let b = ext.data[offset];
+            if b == 0 {
+                offset += 1;
+                continue;
+            }
+            let ext_id = b >> 4;
+            let len = (b & 0x0F) as usize + 1;
+            offset += 1;
+
+            if ext_id == 15 {
+                break;
+            }
+
+            if ext_id == id {
+                found = true;
+                new_data.push((id << 4) | ((data.len() - 1) as u8));
+                new_data.extend_from_slice(data);
+            } else {
+                new_data.push(b);
+                new_data.extend_from_slice(&ext.data[offset..offset + len]);
+            }
+            offset += len;
+        }
+
+        if !found {
+            new_data.push((id << 4) | ((data.len() - 1) as u8));
+            new_data.extend_from_slice(data);
+        }
+
+        // Align to 32-bit boundary
+        while new_data.len() % 4 != 0 {
+            new_data.push(0);
+        }
+
+        ext.data = new_data;
+        self.extension = Some(ext);
+        Ok(())
     }
 
     fn validate(&self) -> RtpResult<()> {
@@ -263,6 +330,19 @@ impl RtpPacket {
         }
         Ok(buffer)
     }
+}
+
+pub fn calculate_abs_send_time(time: SystemTime) -> u32 {
+    let duration = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    // NTP epoch is 1900-01-01, Unix epoch is 1970-01-01. Difference is 70 years.
+    // 70 years in seconds: (70 * 365 + 17) * 24 * 3600 = 2208988800
+    let ntp_seconds = duration.as_secs() + 2208988800;
+    let ntp_fraction = (duration.subsec_nanos() as u64 * (1u64 << 32) / 1_000_000_000) as u32;
+
+    let ntp_timestamp = ((ntp_seconds as u64) << 32) | (ntp_fraction as u64);
+    ((ntp_timestamp >> 14) & 0x00ffffff) as u32
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1055,5 +1135,46 @@ mod tests {
             }
             other => panic!("unexpected packet: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_set_extension() {
+        let mut header = RtpHeader::new(96, 1000, 42, 0x1234_5678);
+        header.set_extension(1, &[0xAA, 0xBB, 0xCC]).unwrap();
+
+        let ext = header.extension.as_ref().unwrap();
+        assert_eq!(ext.profile, 0xBEDE);
+        // 1 byte header: (ID << 4) | (len - 1) = (1 << 4) | 2 = 0x12
+        // Data: AA BB CC
+        assert_eq!(ext.data[0..4], [0x12, 0xAA, 0xBB, 0xCC]);
+
+        // Update existing
+        header.set_extension(1, &[0x11, 0x22]).unwrap();
+        let ext_updated = header.extension.as_ref().unwrap();
+        // (1 << 4) | 1 = 0x11
+        // Data: 11 22
+        // Padding: 00 00
+        assert_eq!(ext_updated.data[0..4], [0x11, 0x11, 0x22, 0x00]);
+
+        // Add another
+        header.set_extension(2, &[0xFF]).unwrap();
+        // Ext 1: 11 11 22
+        // Ext 2: (2 << 4) | 0 = 0x20, Data: FF
+        // Total: 11 11 22 20 FF -> pad to 8 bytes: 11 11 22 20 FF 00 00 00
+        assert!(header.get_extension(1).is_some());
+        assert!(header.get_extension(2).is_some());
+        assert_eq!(header.get_extension(1).unwrap(), vec![0x11, 0x22]);
+        assert_eq!(header.get_extension(2).unwrap(), vec![0xFF]);
+    }
+
+    #[test]
+    fn test_abs_send_time_calculation() {
+        let t = SystemTime::UNIX_EPOCH;
+        let abs = calculate_abs_send_time(t);
+        assert_eq!(abs, 0); // 2208988800 is multiple of 64
+
+        let t2 = t + std::time::Duration::from_secs(1);
+        let abs2 = calculate_abs_send_time(t2);
+        assert_eq!(abs2, 0x40000); // 1 << 18
     }
 }

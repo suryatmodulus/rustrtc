@@ -456,7 +456,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::media::frame::{AudioSampleFormat, VideoPixelFormat};
+    use crate::media::frame::VideoPixelFormat;
 
     #[tokio::test]
     async fn selector_switches_source() {
@@ -524,7 +524,6 @@ mod tests {
             sample_rate: 48_000,
             channels: 2,
             samples: 960,
-            format: AudioSampleFormat::S16,
             data: Bytes::from_static(&[0u8; 10]),
             sequence_number: None,
             payload_type: None,
@@ -577,7 +576,6 @@ mod tests {
             sample_rate: 48_000,
             channels: 2,
             samples: 480,
-            format: AudioSampleFormat::S16,
             data: Bytes::from_static(&[1u8; 4]),
             sequence_number: None,
             payload_type: None,

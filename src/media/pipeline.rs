@@ -212,10 +212,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::{
-        media::frame::{AudioFrame, AudioSampleFormat},
-        media::track::sample_track,
-    };
+    use crate::{media::frame::AudioFrame, media::track::sample_track};
 
     #[tokio::test]
     async fn track_media_source_yields_samples() {
@@ -225,7 +222,6 @@ mod tests {
             .send_audio(AudioFrame {
                 samples: 960,
                 data: Bytes::from_static(&[1; 4]),
-                format: AudioSampleFormat::S16,
                 ..AudioFrame::default()
             })
             .await

@@ -1518,6 +1518,20 @@ impl IceGatherer {
         self.local_candidates.lock().unwrap().clone()
     }
 
+    async fn bind_socket(&self, ip: IpAddr) -> Result<UdpSocket> {
+        if let (Some(start), Some(end)) = (self.config.rtp_start_port, self.config.rtp_end_port) {
+            for port in start..=end {
+                match UdpSocket::bind(SocketAddr::new(ip, port)).await {
+                    Ok(socket) => return Ok(socket),
+                    Err(_) => continue,
+                }
+            }
+            bail!("No available ports in range {}..{}", start, end)
+        } else {
+            UdpSocket::bind(SocketAddr::new(ip, 0)).await.map_err(|e| anyhow!(e))
+        }
+    }
+
     fn get_socket(&self, addr: SocketAddr) -> Option<Arc<UdpSocket>> {
         let sockets = self.sockets.lock().unwrap();
         for socket in sockets.iter() {
@@ -1579,7 +1593,7 @@ impl IceGatherer {
     async fn gather_host_candidates(&self) -> Result<()> {
         // 1. Loopback
         let loopback_ip = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-        match UdpSocket::bind(SocketAddr::new(loopback_ip, 0)).await {
+        match self.bind_socket(loopback_ip).await {
             Ok(socket) => {
                 if let Ok(addr) = socket.local_addr() {
                     let socket = Arc::new(socket);
@@ -1595,7 +1609,7 @@ impl IceGatherer {
         if let Ok(ip) = get_local_ip()
             && !ip.is_loopback()
         {
-            match UdpSocket::bind(SocketAddr::new(ip, 0)).await {
+            match self.bind_socket(ip).await {
                 Ok(socket) => {
                     if let Ok(addr) = socket.local_addr() {
                         let socket = Arc::new(socket);
@@ -1667,8 +1681,8 @@ impl IceGatherer {
     async fn probe_stun(&self, uri: &IceServerUri) -> Result<Option<IceCandidate>> {
         let addr = uri.resolve(self.config.disable_ipv6).await?;
         let socket = match uri.transport {
-            IceTransportProtocol::Udp => UdpSocket::bind("0.0.0.0:0").await?,
-            IceTransportProtocol::Tcp => UdpSocket::bind("0.0.0.0:0").await?,
+            IceTransportProtocol::Udp => self.bind_socket(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))).await?,
+            IceTransportProtocol::Tcp => self.bind_socket(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))).await?,
         };
         let local_addr = socket.local_addr()?;
         let tx_id = random_bytes::<12>();

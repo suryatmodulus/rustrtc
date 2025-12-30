@@ -235,6 +235,8 @@ pub struct RtcConfiguration {
     pub sctp_max_association_retransmits: u32,
     pub sctp_receive_window: usize,
     pub dtls_buffer_size: usize,
+    pub rtp_start_port: Option<u16>,
+    pub rtp_end_port: Option<u16>,
 }
 
 impl Default for RtcConfiguration {
@@ -259,6 +261,8 @@ impl Default for RtcConfiguration {
             sctp_max_association_retransmits: 10,
             sctp_receive_window: 192 * 1024,
             dtls_buffer_size: 100,
+            rtp_start_port: None,
+            rtp_end_port: None,
         }
     }
 }
@@ -332,6 +336,12 @@ impl RtcConfigurationBuilder {
 
     pub fn stun_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.inner.stun_timeout = timeout;
+        self
+    }
+
+    pub fn rtp_port_range(mut self, start: u16, end: u16) -> Self {
+        self.inner.rtp_start_port = Some(start);
+        self.inner.rtp_end_port = Some(end);
         self
     }
 

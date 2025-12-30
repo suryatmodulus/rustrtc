@@ -761,6 +761,7 @@ impl PeerConnection {
                 let mut simulcast = None;
                 let mut rids = Vec::new();
                 let mut rid_ext_id = None;
+                let mut abs_send_time_ext_id = None;
                 let mut fid_group = None;
                 let mut rtx_ssrc = None;
 
@@ -811,11 +812,18 @@ impl PeerConnection {
                         }
                     } else if attr.key == "extmap"
                         && let Some(val) = &attr.value
-                        && val.contains("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id")
                     {
-                        if let Some(id_str) = val.split_whitespace().next() {
-                            if let Ok(id) = id_str.parse::<u8>() {
-                                rid_ext_id = Some(id);
+                        if val.contains("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id") {
+                            if let Some(id_str) = val.split_whitespace().next() {
+                                if let Ok(id) = id_str.parse::<u8>() {
+                                    rid_ext_id = Some(id);
+                                }
+                            }
+                        } else if val.contains(crate::sdp::ABS_SEND_TIME_URI) {
+                            if let Some(id_str) = val.split_whitespace().next() {
+                                if let Ok(id) = id_str.parse::<u8>() {
+                                    abs_send_time_ext_id = Some(id);
+                                }
                             }
                         }
                     }
@@ -824,6 +832,12 @@ impl PeerConnection {
                 if let Some(id) = rid_ext_id {
                     if let Some(transport) = self.inner.rtp_transport.lock().unwrap().as_ref() {
                         transport.set_rid_extension_id(id);
+                    }
+                }
+
+                if let Some(id) = abs_send_time_ext_id {
+                    if let Some(transport) = self.inner.rtp_transport.lock().unwrap().as_ref() {
+                        transport.set_abs_send_time_extension_id(id);
                     }
                 }
 
@@ -1027,13 +1041,6 @@ impl PeerConnection {
         }
         *self.inner.rtp_transport.lock().unwrap() = Some(rtp_transport.clone());
 
-        self.inner
-            .ice_transport
-            .set_data_receiver(ice_conn.clone())
-            .await;
-
-        // Update receivers immediately to ensure listeners are registered
-        // Also set transport reference on transceivers for late-attached senders
         {
             let transceivers = self.inner.transceivers.lock().unwrap();
             for t in transceivers.iter() {
@@ -1047,6 +1054,11 @@ impl PeerConnection {
             }
         }
 
+        self.inner
+            .ice_transport
+            .set_data_receiver(ice_conn.clone())
+            .await;
+
         if self.config().transport_mode == TransportMode::Srtp {
             self.setup_sdes(&rtp_transport)?;
             let rtcp_loop = Self::create_rtcp_loop(
@@ -1054,7 +1066,7 @@ impl PeerConnection {
                 Arc::downgrade(&self.inner),
                 self.inner.stats_collector.clone(),
             );
-            return Ok(Box::pin(rtcp_loop));
+            return Ok(Box::pin(rtcp_loop) as Pin<Box<dyn Future<Output = ()> + Send>>);
         }
 
         if self.config().transport_mode == TransportMode::Rtp {
@@ -1069,6 +1081,7 @@ impl PeerConnection {
                 let sender_arc = t.sender.lock().unwrap().clone();
                 let receiver_arc = t.receiver.lock().unwrap().clone();
 
+                // Set sender transport
                 if let Some(sender) = &sender_arc {
                     let mid_opt = t.mid();
                     trace!(
@@ -1079,14 +1092,14 @@ impl PeerConnection {
                     sender.set_transport(rtp_transport.clone());
                 }
 
+                // Set feedback SSRC (receiver transport already set above)
                 if let Some(receiver) = &receiver_arc {
-                    receiver.set_transport(rtp_transport.clone());
                     if let Some(sender) = &sender_arc {
                         receiver.set_feedback_ssrc(sender.ssrc());
                     }
                 }
             }
-            return Ok(Box::pin(rtcp_loop));
+            return Ok(Box::pin(rtcp_loop) as Pin<Box<dyn Future<Output = ()> + Send>>);
         }
 
         let (dtls, incoming_data_rx, dtls_runner) = DtlsTransport::new(
@@ -1129,8 +1142,8 @@ impl PeerConnection {
         let inner_weak = Arc::downgrade(&self.inner);
         let stats_collector = self.inner.stats_collector.clone();
 
-        let mut dtls_runner = Box::pin(dtls_runner);
-        let mut sctp_runner = Box::pin(sctp_runner);
+        let mut dtls_runner: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(dtls_runner);
+        let mut sctp_runner: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(sctp_runner);
 
         let inner_weak_dc = inner_weak.clone();
         let dc_listener = async move {
@@ -1142,7 +1155,7 @@ impl PeerConnection {
                 }
             }
         };
-        let mut dc_listener = Box::pin(dc_listener);
+        let mut dc_listener: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(dc_listener);
 
         let mut state_rx = dtls_clone.subscribe_state();
         loop {
@@ -1160,7 +1173,7 @@ impl PeerConnection {
                     let pair_monitor =
                         Self::create_pair_monitor(pair_rx.clone(), ice_conn_monitor.clone());
 
-                    let combined = Box::pin(async move {
+                    let combined: Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
                         tokio::select! {
                             _ = rtcp_loop => {},
                             _ = dtls_runner => {},
@@ -1203,7 +1216,7 @@ impl PeerConnection {
             }
         }
 
-        Ok(Box::pin(async {}))
+        Ok(Box::pin(async {}) as Pin<Box<dyn Future<Output = ()> + Send>>)
     }
 
     fn setup_sdes(&self, rtp_transport: &Arc<RtpTransport>) -> RtcResult<()> {
@@ -2066,11 +2079,36 @@ impl PeerConnectionInner {
                 None
             };
 
+            // Check if remote side expects us to send (for B2BUA scenarios)
+            let remote_expects_media = if sdp_type == SdpType::Answer {
+                let remote_guard = self.remote_description.lock().unwrap();
+                if let Some(remote) = remote_guard.as_ref() {
+                    // Find the matching remote section by mid
+                    remote
+                        .media_sections
+                        .iter()
+                        .find(|section| section.mid == mid)
+                        .map(|section| {
+                            // Remote expects media if their direction is sendrecv or sendonly
+                            matches!(
+                                section.direction,
+                                crate::sdp::Direction::SendRecv | crate::sdp::Direction::SendOnly
+                            )
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
             // If we are supposed to send, but have no sender (and it's not Application),
             // we must downgrade direction to avoid ghost tracks.
             if direction.sends()
                 && sender_info.is_none()
                 && transceiver.kind() != MediaKind::Application
+                && !remote_expects_media
             {
                 direction = match direction {
                     TransceiverDirection::SendRecv => TransceiverDirection::RecvOnly,
@@ -2257,6 +2295,19 @@ impl PeerConnectionInner {
             section.add_video_extmaps(rid_id, repaired_rid_id);
         }
 
+        // Add abs-send-time extmap
+        let mut abs_send_time_id =
+            self.get_remote_extmap_id(&section.mid, crate::sdp::ABS_SEND_TIME_URI);
+        if sdp_type == SdpType::Offer && abs_send_time_id.is_none() {
+            abs_send_time_id = Some("3".to_string()); // Default ID for abs-send-time
+        }
+        if let Some(id) = abs_send_time_id {
+            section.attributes.push(crate::sdp::Attribute::new(
+                "extmap",
+                Some(format!("{} {}", id, crate::sdp::ABS_SEND_TIME_URI)),
+            ));
+        }
+
         if self.config.transport_mode != TransportMode::Rtp {
             let setup_value = match sdp_type {
                 SdpType::Offer => "actpass",
@@ -2275,35 +2326,32 @@ impl PeerConnectionInner {
     }
 
     fn get_remote_video_extmap_ids(&self, mid: &str) -> (Option<String>, Option<String>) {
+        let rid_id =
+            self.get_remote_extmap_id(mid, "urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id");
+        let repaired_rid_id = self.get_remote_extmap_id(
+            mid,
+            "urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id",
+        );
+        (rid_id, repaired_rid_id)
+    }
+
+    fn get_remote_extmap_id(&self, mid: &str, uri: &str) -> Option<String> {
         let remote = self.remote_description.lock().unwrap();
         if let Some(desc) = &*remote {
-            let remote_section = match desc.media_sections.iter().find(|s| s.mid == mid) {
-                Some(s) => s,
-                None => return (None, None),
-            };
-            let mut rid_id = None;
-            let mut repaired_rid_id = None;
+            let remote_section = desc.media_sections.iter().find(|s| s.mid == mid)?;
             for attr in &remote_section.attributes {
                 if attr.key != "extmap" {
                     continue;
                 }
-                let val = match &attr.value {
-                    Some(v) => v,
-                    None => continue,
-                };
-                if val.contains("urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id") {
+                let val = attr.value.as_ref()?;
+                if val.contains(uri) {
                     if let Some(id_str) = val.split_whitespace().next() {
-                        rid_id = Some(id_str.to_string());
-                    }
-                } else if val.contains("urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id") {
-                    if let Some(id_str) = val.split_whitespace().next() {
-                        repaired_rid_id = Some(id_str.to_string());
+                        return Some(id_str.to_string());
                     }
                 }
             }
-            return (rid_id, repaired_rid_id);
         }
-        (None, None)
+        None
     }
 
     fn close(&self) {
@@ -2551,7 +2599,7 @@ pub struct RtpSender {
     rtcp_tx: broadcast::Sender<RtcpPacket>,
     stop_tx: Arc<tokio::sync::Notify>,
     next_sequence_number: Arc<AtomicU16>,
-    interceptors: Vec<Arc<dyn RtpSenderInterceptor>>,
+    interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
 }
 
 pub struct RtpSenderBuilder {
@@ -2559,7 +2607,7 @@ pub struct RtpSenderBuilder {
     ssrc: u32,
     stream_id: String,
     params: RtpCodecParameters,
-    interceptors: Vec<Arc<dyn RtpSenderInterceptor>>,
+    interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
 }
 
 impl RtpSenderBuilder {
@@ -2621,7 +2669,7 @@ impl RtpSender {
         ssrc: u32,
         stream_id: String,
         params: RtpCodecParameters,
-        interceptors: Vec<Arc<dyn RtpSenderInterceptor>>,
+        interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
     ) -> Self {
         Self::new_internal(track, ssrc, stream_id, params, interceptors)
     }
@@ -2631,7 +2679,7 @@ impl RtpSender {
         ssrc: u32,
         stream_id: String,
         params: RtpCodecParameters,
-        interceptors: Vec<Arc<dyn RtpSenderInterceptor>>,
+        interceptors: Vec<Arc<dyn RtpSenderInterceptor + Send + Sync>>,
     ) -> Self {
         let track_label = track.id().to_string();
         let track_id = Arc::<str>::from(track_label.clone());
@@ -2681,7 +2729,7 @@ impl RtpSender {
         self.params.lock().unwrap().clone()
     }
 
-    pub fn interceptors(&self) -> &[Arc<dyn RtpSenderInterceptor>] {
+    pub fn interceptors(&self) -> &[Arc<dyn RtpSenderInterceptor + Send + Sync>] {
         &self.interceptors
     }
 
@@ -2730,48 +2778,57 @@ impl RtpSender {
                                     p.payload_type
                                 };
 
+                                // Check if application provided sequence_number (indicates app wants control)
+                                let app_controlled = match &sample {
+                                    crate::media::MediaSample::Audio(f) => f.sequence_number.is_some(),
+                                    crate::media::MediaSample::Video(f) => f.sequence_number.is_some(),
+                                };
+
                                 let mut packet = sample.into_rtp_packet(
                                     ssrc,
                                     payload_type,
                                     &mut sequence_number,
                                 );
 
-                                // Timestamp rewriting
-                                let src_ts = packet.header.timestamp;
-                                if let Some(last_src) = last_source_ts {
-                                    let delta = src_ts.wrapping_sub(last_src);
-                                    // Check if src_ts is newer (delta < 2^31)
-                                    if delta < 0x80000000 {
-                                        // If delta is very large (e.g. > 10 seconds), assume source switch/reset
-                                        // 10 seconds * 90000 = 900,000.
-                                        if delta > 900_000 {
-                                            // Discontinuity detected.
-                                            // We want the new timestamp to continue from where we left off.
-                                            // But we don't track last_out_ts explicitly here, we rely on offset.
-                                            // last_out_ts was (last_src + old_offset).
-                                            // new_out_ts should be (last_out_ts + small_delta).
-                                            // Let's assume small_delta = 3000 (1/30s at 90khz) or just 1 to be safe.
-                                            // new_out_ts = last_src + old_offset + 3000.
-                                            // new_out_ts = src_ts + new_offset.
-                                            // => new_offset = last_src + old_offset + 3000 - src_ts.
-                                            timestamp_offset = last_src.wrapping_add(timestamp_offset).wrapping_add(3000).wrapping_sub(src_ts);
+                                if !app_controlled {
+                                    // Application doesn't control seq/ts, use rustrtc's logic
+                                    // Timestamp rewriting
+                                    let src_ts = packet.header.timestamp;
+                                    if let Some(last_src) = last_source_ts {
+                                        let delta = src_ts.wrapping_sub(last_src);
+                                        // Check if src_ts is newer (delta < 2^31)
+                                        if delta < 0x80000000 {
+                                            // If delta is very large (e.g. > 10 seconds), assume source switch/reset
+                                            // 10 seconds * 90000 = 900,000.
+                                            if delta > 900_000 {
+                                                // Discontinuity detected.
+                                                // We want the new timestamp to continue from where we left off.
+                                                // But we don't track last_out_ts explicitly here, we rely on offset.
+                                                // last_out_ts was (last_src + old_offset).
+                                                // new_out_ts should be (last_out_ts + small_delta).
+                                                // Let's assume small_delta = 3000 (1/30s at 90khz) or just 1 to be safe.
+                                                // new_out_ts = last_src + old_offset + 3000.
+                                                // new_out_ts = src_ts + new_offset.
+                                                // => new_offset = last_src + old_offset + 3000 - src_ts.
+                                                timestamp_offset = last_src.wrapping_add(timestamp_offset).wrapping_add(3000).wrapping_sub(src_ts);
+                                            }
+                                            last_source_ts = Some(src_ts);
                                         }
+                                        // If src_ts is older (delta >= 2^31), it's an out-of-order packet.
+                                        // We use the existing offset and do NOT update last_source_ts.
+                                    } else {
+                                        // First packet, establish offset
+                                        // We want out_ts = src_ts + offset.
+                                        // We initialized offset to random.
+                                        // So out_ts will be random. Correct.
                                         last_source_ts = Some(src_ts);
                                     }
-                                    // If src_ts is older (delta >= 2^31), it's an out-of-order packet.
-                                    // We use the existing offset and do NOT update last_source_ts.
-                                } else {
-                                    // First packet, establish offset
-                                    // We want out_ts = src_ts + offset.
-                                    // We initialized offset to random.
-                                    // So out_ts will be random. Correct.
-                                    last_source_ts = Some(src_ts);
+
+                                    packet.header.timestamp = src_ts.wrapping_add(timestamp_offset);
+
+                                    // Rewrite sequence number
+                                    packet.header.sequence_number = next_seq.fetch_add(1, Ordering::Relaxed);
                                 }
-
-                                packet.header.timestamp = src_ts.wrapping_add(timestamp_offset);
-
-                                // Rewrite sequence number
-                                packet.header.sequence_number = next_seq.fetch_add(1, Ordering::Relaxed);
 
                                 for interceptor in &interceptors {
                                     interceptor.on_packet_sent(&packet).await;
