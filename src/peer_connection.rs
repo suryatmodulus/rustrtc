@@ -2363,9 +2363,31 @@ impl PeerConnectionInner {
         let _ = self.ice_connection_state.send(IceConnectionState::Closed);
         let _ = self.ice_gathering_state.send(IceGatheringState::Complete);
 
-        // Send RTCP BYE if possible
+        // Clean up all tracks to prevent audio bleeding into new connections
+        {
+            let transceivers = self.transceivers.lock().unwrap();
+            for t in transceivers.iter() {
+                // Stop receiver tracks by marking them as ended
+                if let Some(receiver) = t.receiver() {
+                    let track = receiver.track();
+                    track.stop();
+                    tracing::debug!(
+                        "PeerConnection.close: marked receiver track {} as ended",
+                        track.id()
+                    );
+                }
+            }
+        }
+
+        // Clear RTP transport listeners to stop receiving packets
         let rtp_transport = self.rtp_transport.lock().unwrap().clone();
-        if let Some(transport) = rtp_transport {
+        if let Some(transport) = rtp_transport.as_ref() {
+            let count = transport.clear_listeners();
+            if count > 0 {
+                tracing::debug!("PeerConnection.close: cleared {} listeners", count);
+            }
+
+            // Send RTCP BYE
             let transceivers = self.transceivers.lock().unwrap();
             let mut ssrcs = Vec::new();
             for t in transceivers.iter() {

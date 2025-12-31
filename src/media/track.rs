@@ -71,6 +71,11 @@ impl SampleStreamTrack {
     pub fn id(&self) -> &str {
         &self.id
     }
+
+    /// Stop this track by marking it as ended
+    pub fn stop(&self) {
+        self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone)]

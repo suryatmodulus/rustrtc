@@ -11,6 +11,7 @@ struct BufferedSample {
 pub struct JitterBuffer {
     samples: BTreeMap<u16, BufferedSample>,
     last_delivered_seq: Option<u16>,
+    last_delivered_timestamp: Option<u32>,
     max_delay: Duration,
     min_delay: Duration,
     capacity: usize,
@@ -21,6 +22,7 @@ impl JitterBuffer {
         Self {
             samples: BTreeMap::new(),
             last_delivered_seq: None,
+            last_delivered_timestamp: None,
             max_delay,
             min_delay,
             capacity,
@@ -28,9 +30,9 @@ impl JitterBuffer {
     }
 
     pub fn push(&mut self, sample: MediaSample) {
-        let seq_opt = match &sample {
-            MediaSample::Audio(f) => f.sequence_number,
-            MediaSample::Video(f) => f.sequence_number,
+        let (seq_opt, timestamp) = match &sample {
+            MediaSample::Audio(f) => (f.sequence_number, f.rtp_timestamp),
+            MediaSample::Video(f) => (f.sequence_number, f.rtp_timestamp),
         };
 
         let Some(seq) = seq_opt else {
@@ -41,6 +43,41 @@ impl JitterBuffer {
         if let Some(last) = self.last_delivered_seq {
             if !is_newer(seq, last) {
                 return;
+            }
+        }
+
+        // Validate timestamp continuity to reject interleaved streams with different timestamp bases
+        if let Some(last_ts) = self.last_delivered_timestamp {
+            // Calculate expected timestamp increment based on sample rate
+            // For audio at 8kHz with 20ms packets: 160 samples
+            // For video at 90kHz with 33ms packets: ~3000 samples
+            // We allow up to 10 seconds of jump to handle legitimate gaps
+            let max_reasonable_jump: u32 = match &sample {
+                MediaSample::Audio(f) => f.sample_rate * 10,  // 10 seconds
+                MediaSample::Video(_) => 90000 * 10,           // 10 seconds at 90kHz
+            };
+
+            let ts_diff = timestamp.wrapping_sub(last_ts);
+
+            // Reject packets with timestamp jumps > max_reasonable_jump (forward or backward)
+            // Using wrapping math: if ts_diff > half of u32::MAX, it's a backward jump
+            if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
+                // Massive forward jump - likely from a different stream
+                tracing::debug!(
+                    "JitterBuffer: Rejecting packet with large timestamp jump: seq={} ts={} last_ts={} diff={} (>{}s)",
+                    seq, timestamp, last_ts, ts_diff, ts_diff / 8000
+                );
+                return;
+            } else if ts_diff > (u32::MAX / 2) {
+                // Backward jump (wrapped subtraction)
+                let backward_diff = last_ts.wrapping_sub(timestamp);
+                if backward_diff > max_reasonable_jump {
+                    tracing::debug!(
+                        "JitterBuffer: Rejecting packet with large backward timestamp jump: seq={} ts={} last_ts={} backward_diff=-{} (>{}s)",
+                        seq, timestamp, last_ts, backward_diff, backward_diff / 8000
+                    );
+                    return;
+                }
             }
         }
 
@@ -79,6 +116,14 @@ impl JitterBuffer {
         if should_deliver {
             let buffered = self.samples.remove(&first_seq).unwrap();
             self.last_delivered_seq = Some(first_seq);
+
+            // Update last delivered timestamp
+            let timestamp = match &buffered.sample {
+                MediaSample::Audio(f) => f.rtp_timestamp,
+                MediaSample::Video(f) => f.rtp_timestamp,
+            };
+            self.last_delivered_timestamp = Some(timestamp);
+
             Some(buffered.sample)
         } else {
             None

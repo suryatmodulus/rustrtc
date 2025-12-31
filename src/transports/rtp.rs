@@ -144,6 +144,37 @@ impl RtpTransport {
         };
         self.transport.send_rtcp(&protected).await
     }
+
+    /// Clear all listeners to stop receiving packets.
+    /// This is called when PeerConnection is closed to prevent audio bleeding into new connections.
+    pub fn clear_listeners(&self) -> usize {
+        let mut count = 0;
+
+        // Clear SSRC listeners
+        {
+            let mut listeners = self.listeners.lock().unwrap();
+            count += listeners.len();
+            listeners.clear();
+        }
+
+        // Clear RID listeners
+        {
+            let mut rid_listeners = self.rid_listeners.lock().unwrap();
+            count += rid_listeners.len();
+            rid_listeners.clear();
+        }
+
+        // Clear RTCP listener
+        {
+            let mut rtcp_listener = self.rtcp_listener.lock().unwrap();
+            if rtcp_listener.is_some() {
+                *rtcp_listener = None;
+                count += 1;
+            }
+        }
+
+        count
+    }
 }
 
 #[async_trait]
@@ -237,10 +268,7 @@ impl PacketReceiver for RtpTransport {
                     // Fallback to SSRC listener
                     if listener.is_none() {
                         let listeners = self.listeners.lock().unwrap();
-                        listener = listeners
-                            .get(&ssrc)
-                            .or_else(|| listeners.get(&2000))
-                            .cloned();
+                        listener = listeners.get(&ssrc).cloned();
                     }
 
                     if let Some(tx) = listener {
