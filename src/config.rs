@@ -259,12 +259,12 @@ impl Default for RtcConfiguration {
             ssrc_start: 10000,
             stun_timeout: std::time::Duration::from_secs(5),
             ice_connection_timeout: std::time::Duration::from_secs(30),
-            sctp_rto_initial: std::time::Duration::from_secs(1),
-            sctp_rto_min: std::time::Duration::from_secs(1),
+            sctp_rto_initial: std::time::Duration::from_millis(200),
+            sctp_rto_min: std::time::Duration::from_millis(100),
             sctp_rto_max: std::time::Duration::from_secs(60),
             sctp_max_association_retransmits: 8,
             sctp_receive_window: 1024 * 1024,
-            dtls_buffer_size: 100,
+            dtls_buffer_size: 2048,
             rtp_start_port: None,
             rtp_end_port: None,
         }
@@ -379,8 +379,8 @@ mod tests {
     fn test_rtc_configuration_defaults() {
         let config = RtcConfiguration::default();
         assert_eq!(config.ice_connection_timeout, Duration::from_secs(30));
-        assert_eq!(config.sctp_rto_initial, Duration::from_secs(1));
-        assert_eq!(config.sctp_rto_min, Duration::from_secs(1));
+        assert_eq!(config.sctp_rto_initial, Duration::from_millis(200));
+        assert_eq!(config.sctp_rto_min, Duration::from_millis(100));
         assert_eq!(config.sctp_rto_max, Duration::from_secs(60));
         assert_eq!(config.sctp_max_association_retransmits, 8);
     }

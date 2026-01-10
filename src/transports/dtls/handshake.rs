@@ -124,8 +124,7 @@ impl Random {
         let gmt_unix_time = since_the_epoch.as_secs() as u32;
 
         let mut random_bytes = [0u8; 28];
-        use rand_core::{OsRng, RngCore};
-        OsRng.fill_bytes(&mut random_bytes);
+        rand::fill(&mut random_bytes);
 
         Self {
             gmt_unix_time,

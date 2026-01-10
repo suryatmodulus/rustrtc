@@ -28,6 +28,8 @@ struct ChunkRecord {
     stream_id: u16,
     abandoned: bool,
     fast_retransmit: bool,
+    in_flight: bool,
+    acked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +163,7 @@ struct SctpInner {
 
     // Fast Recovery
     fast_recovery_exit_tsn: AtomicU32,
+    fast_recovery_active: AtomicBool,
 
     // Association Retransmission Limit
     max_association_retransmits: u32,
@@ -175,8 +178,14 @@ struct SctpInner {
     // Receiver Packet Counter (for Quick-Start ACKs)
     packets_received: AtomicU64,
 
+    // Flow control serialization to prevent overshoot
+    tx_lock: tokio::sync::Mutex<()>,
+
     // Cached Timeout State
     cached_rto_timeout: Mutex<Option<(Instant, Duration)>>,
+
+    // Outgoing Packet Queue to prevent deadlocks
+    outgoing_packet_tx: mpsc::UnboundedSender<Bytes>,
 }
 
 struct SctpCleanupGuard<'a> {
@@ -195,7 +204,7 @@ fn build_gap_ack_blocks_from_map(
 
     for &tsn in received.keys() {
         // Ignore any TSN that is already cumulatively acked or would wrap.
-        if tsn <= cumulative_tsn_ack {
+        if (tsn.wrapping_sub(cumulative_tsn_ack) as i32) <= 0 {
             continue;
         }
 
@@ -252,10 +261,30 @@ fn apply_sack_to_sent_queue(
 ) -> SackOutcome {
     let before_head = sent_queue.keys().next().cloned();
 
+    // 0. Filter out late SACKs
+    if let Some(&lowest_tsn) = sent_queue.keys().next() {
+        if (cumulative_tsn_ack.wrapping_sub(lowest_tsn.wrapping_sub(1)) as i32) < 0 {
+            // This SACK is even older than our earliest outstanding TSN,
+            // except for the case where it might be acknowledging gaps.
+            // But usually this means it's a reordered old SACK.
+            // Check if max_reported is also old.
+            let mut max_reported = cumulative_tsn_ack;
+            for (_start, end) in gap_blocks {
+                let block_end = cumulative_tsn_ack.wrapping_add(*end as u32);
+                if (block_end.wrapping_sub(max_reported) as i32) > 0 {
+                    max_reported = block_end;
+                }
+            }
+            if (max_reported.wrapping_sub(lowest_tsn) as i32) < 0 {
+                return SackOutcome::default();
+            }
+        }
+    }
+
     let mut max_reported = cumulative_tsn_ack;
     for (_start, end) in gap_blocks {
         let block_end = cumulative_tsn_ack.wrapping_add(*end as u32);
-        if block_end > max_reported {
+        if (block_end.wrapping_sub(max_reported) as i32) > 0 {
             max_reported = block_end;
         }
     }
@@ -263,22 +292,28 @@ fn apply_sack_to_sent_queue(
     let mut outcome = SackOutcome::default();
     outcome.max_reported = max_reported;
 
-    // 1. Remove everything that the SACK explicitly acknowledges.
-    // Since BTreeMap is ordered, we can efficiently remove all TSNs <= cumulative_tsn_ack.
-    while let Some(&tsn) = sent_queue.keys().next() {
-        if tsn.wrapping_sub(cumulative_tsn_ack) as i32 <= 0 {
-            if let Some(record) = sent_queue.remove(&tsn) {
-                let len = record.payload.len();
+    // 1. Remove everything that the SACK explicitly acknowledges via cumulative TSN.
+    let to_remove: Vec<u32> = sent_queue
+        .keys()
+        .filter(|&&tsn| (tsn.wrapping_sub(cumulative_tsn_ack) as i32) <= 0)
+        .cloned()
+        .collect();
+
+    for tsn in to_remove {
+        if let Some(record) = sent_queue.remove(&tsn) {
+            let len = record.payload.len();
+            trace!("SACK acknowledging TSN {} (len={})", tsn, len);
+            if record.in_flight {
                 outcome.flight_reduction += len;
-                outcome.bytes_acked_by_cum_tsn += len;
-                if record.transmit_count == 0 {
-                    outcome
-                        .rtt_samples
-                        .push(now.duration_since(record.sent_time).as_secs_f64());
-                }
             }
-        } else {
-            break;
+            // Even if it was already acked via GAPS, we count it for CWND growth now
+            // because it's officially cumulative-acked.
+            outcome.bytes_acked_by_cum_tsn += len;
+            if record.transmit_count == 0 && !record.acked {
+                outcome
+                    .rtt_samples
+                    .push(now.duration_since(record.sent_time).as_secs_f64());
+            }
         }
     }
 
@@ -287,41 +322,73 @@ fn apply_sack_to_sent_queue(
         let s = cumulative_tsn_ack.wrapping_add(*start as u32);
         let e = cumulative_tsn_ack.wrapping_add(*end as u32);
 
-        // We only need to check TSNs in the range [s, e]
-        let to_remove: Vec<u32> = sent_queue.range(s..=e).map(|(&tsn, _)| tsn).collect();
+        let mut to_ack = Vec::new();
+        if s <= e {
+            for (&tsn, _) in sent_queue.range(s..=e) {
+                to_ack.push(tsn);
+            }
+        } else {
+            for (&tsn, _) in sent_queue.range(s..) {
+                to_ack.push(tsn);
+            }
+            for (&tsn, _) in sent_queue.range(..=e) {
+                to_ack.push(tsn);
+            }
+        }
 
-        for tsn in to_remove {
-            if let Some(record) = sent_queue.remove(&tsn) {
-                outcome.flight_reduction += record.payload.len();
-                if record.transmit_count == 0 {
-                    outcome
-                        .rtt_samples
-                        .push(now.duration_since(record.sent_time).as_secs_f64());
+        for tsn in to_ack {
+            if let Some(record) = sent_queue.get_mut(&tsn) {
+                if !record.acked {
+                    record.acked = true;
+                    if record.in_flight {
+                        record.in_flight = false;
+                        outcome.flight_reduction += record.payload.len();
+                    }
+                    if record.transmit_count == 0 {
+                        outcome
+                            .rtt_samples
+                            .push(now.duration_since(record.sent_time).as_secs_f64());
+                    }
                 }
             }
         }
     }
 
     // 3. Mark missing reports and schedule fast retransmits.
-    // We only need to check TSNs up to max_reported.
-    for (&tsn, record) in sent_queue.range_mut(..=max_reported) {
-        // If it's in the queue and <= max_reported, it's missing (since we already removed gap-acked ones)
-        record.missing_reports = record.missing_reports.saturating_add(1);
+    // Use order-aware iteration up to max_reported.
+    let mut to_retransmit = Vec::new();
+    for (&tsn, record) in sent_queue.iter_mut() {
+        // if tsn <= max_reported
+        if (tsn.wrapping_sub(max_reported) as i32) <= 0 {
+            if !record.acked {
+                record.missing_reports = record.missing_reports.saturating_add(1);
 
-        if record.missing_reports >= DUP_THRESH && !record.abandoned && !record.fast_retransmit {
-            record.missing_reports = 0;
-            record.transmit_count += 1;
-            record.sent_time = now;
-            record.fast_retransmit = true;
-            outcome.retransmit.push((tsn, record.payload.clone()));
+                if record.missing_reports >= DUP_THRESH
+                    && !record.abandoned
+                    && !record.fast_retransmit
+                {
+                    record.missing_reports = 0;
+                    record.transmit_count += 1;
+                    record.sent_time = now; // Reset timer for retransmission
+                    record.fast_retransmit = true;
+
+                    // Note: We do NOT remove from in_flight or reduce flight_size here per spec.
+                    to_retransmit.push((tsn, record.payload.clone()));
+                }
+            }
         }
     }
-
-    // Reset missing reports for anything beyond max_reported (optional but safer)
-    // Actually, we don't need to iterate beyond max_reported.
+    outcome.retransmit = to_retransmit;
 
     let after_head = sent_queue.keys().next().cloned();
     outcome.head_moved = before_head != after_head;
+
+    if !outcome.retransmit.is_empty() {
+        trace!(
+            "Fast Retransmission triggered for {} chunks",
+            outcome.retransmit.len()
+        );
+    }
 
     outcome
 }
@@ -353,7 +420,7 @@ pub struct SctpTransport {
 impl SctpTransport {
     pub fn new(
         dtls_transport: Arc<DtlsTransport>,
-        incoming_data_rx: mpsc::Receiver<Bytes>,
+        incoming_data_rx: mpsc::UnboundedReceiver<Bytes>,
         data_channels: Arc<Mutex<Vec<Weak<DataChannel>>>>,
         local_port: u16,
         remote_port: u16,
@@ -364,8 +431,10 @@ impl SctpTransport {
         Arc<Self>,
         impl std::future::Future<Output = ()> + Send + 'static,
     ) {
+        let (outgoing_packet_tx, mut outgoing_packet_rx) = mpsc::unbounded_channel::<Bytes>();
+
         let inner = Arc::new(SctpInner {
-            dtls_transport,
+            dtls_transport: dtls_transport.clone(),
             state: Arc::new(Mutex::new(SctpState::New)),
             data_channels,
             local_port,
@@ -400,12 +469,15 @@ impl SctpTransport {
             peer_reconfig_request_sn: AtomicU32::new(u32::MAX), // Initial value to allow 0
             local_rwnd: config.sctp_receive_window,
             fast_recovery_exit_tsn: AtomicU32::new(0),
+            fast_recovery_active: AtomicBool::new(false),
             max_association_retransmits: config.sctp_max_association_retransmits,
             association_error_count: AtomicU32::new(0),
             heartbeat_sent_time: Mutex::new(None),
             used_rwnd: AtomicUsize::new(0),
             packets_received: AtomicU64::new(0),
+            tx_lock: tokio::sync::Mutex::new(()),
             cached_rto_timeout: Mutex::new(None),
+            outgoing_packet_tx,
         });
 
         let close_tx = Arc::new(tokio::sync::Notify::new());
@@ -417,8 +489,23 @@ impl SctpTransport {
         });
 
         let inner_clone = inner.clone();
+        let dtls_transport_clone = dtls_transport.clone();
         let runner = async move {
-            inner_clone.run_loop(close_rx, incoming_data_rx).await;
+            let close_rx_2 = close_rx.clone();
+            tokio::select! {
+                _ = inner_clone.run_loop(close_rx, incoming_data_rx) => {},
+                _ = async {
+                    while let Some(packet) = outgoing_packet_rx.recv().await {
+                        if let Err(e) = dtls_transport_clone.send(packet).await {
+                            warn!("SCTP Failed to send outgoing DTLS packet: {}", e);
+                            if e.to_string().contains("DTLS not connected") {
+                                break;
+                            }
+                        }
+                    }
+                } => {},
+                _ = close_rx_2.notified() => {}
+            }
         };
 
         (transport, runner)
@@ -478,7 +565,7 @@ impl SctpInner {
     async fn run_loop(
         &self,
         close_rx: Arc<tokio::sync::Notify>,
-        mut incoming_data_rx: mpsc::Receiver<Bytes>,
+        mut incoming_data_rx: mpsc::UnboundedReceiver<Bytes>,
     ) {
         debug!("SctpTransport run_loop started");
         *self.state.lock().unwrap() = SctpState::Connecting;
@@ -516,11 +603,6 @@ impl SctpInner {
         loop {
             let now = Instant::now();
 
-            // Check for timeouts at the start of each loop iteration
-            if let Err(e) = self.handle_timeout().await {
-                warn!("SCTP handle timeout error: {}", e);
-            }
-
             // 1. Calculate RTO Timeout
             let rto_timeout_cached = {
                 let cached = self.cached_rto_timeout.lock().unwrap();
@@ -540,9 +622,20 @@ impl SctpInner {
             } else {
                 let t = {
                     let sent_queue = self.sent_queue.lock().unwrap();
-                    if let Some((_, record)) = sent_queue.iter().next() {
-                        let rto = self.rto_state.lock().unwrap().rto;
+                    let rto = self.rto_state.lock().unwrap().rto;
+                    let mut soonest_expiry = None;
+
+                    for record in sent_queue.values() {
+                        if record.acked {
+                            continue;
+                        }
                         let expiry = record.sent_time + Duration::from_secs_f64(rto);
+                        if soonest_expiry.is_none() || expiry < soonest_expiry.unwrap() {
+                            soonest_expiry = Some(expiry);
+                        }
+                    }
+
+                    if let Some(expiry) = soonest_expiry {
                         if expiry > now {
                             expiry - now
                         } else {
@@ -636,10 +729,6 @@ impl SctpInner {
                                     warn!("SCTP handle packet error: {}", e);
                                 }
                             }
-                            // Check for timeouts after processing a batch of packets
-                            if let Err(e) = self.handle_timeout().await {
-                                warn!("SCTP handle timeout error: {}", e);
-                            }
                         }
                         None => {
                             warn!("SCTP loop error: Channel closed");
@@ -661,12 +750,46 @@ impl SctpInner {
         let rto = { self.rto_state.lock().unwrap().rto };
         {
             let mut sent_queue = self.sent_queue.lock().unwrap();
-            if let Some((_, record)) = sent_queue.iter().next() {
-                if now < record.sent_time + Duration::from_secs_f64(rto) {
-                    return Ok(());
+
+            // Check if anything has expired
+            let mut any_expired = false;
+            for record in sent_queue.values() {
+                if !record.acked && now >= record.sent_time + Duration::from_secs_f64(rto) {
+                    any_expired = true;
+                    break;
                 }
-            } else {
+            }
+
+            if !any_expired {
                 return Ok(());
+            }
+
+            // If we are here, at least one packet timed out.
+            // RFC 4960 Section 6.3.3 (E2): Adjust flight_size to 0 for this destination.
+            for record in sent_queue.values_mut() {
+                if record.in_flight {
+                    record.in_flight = false;
+                    let len = record.payload.len();
+                    self.flight_size
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |f| {
+                            Some(f.saturating_sub(len))
+                        })
+                        .ok();
+                }
+                // CRITICAL: Restart the T3-rtx timer for ALL outstanding chunks
+                // to prevent "RTO explosions" where chunks time out one by one in 10ms intervals.
+                if !record.acked {
+                    record.sent_time = now;
+                    record.missing_reports = 0;
+                    record.fast_retransmit = false;
+                }
+            }
+            self.flow_control_notify.notify_waiters();
+
+            // Clear cached RTO timeout to force immediate recalculation in run_loop
+            {
+                let mut cached = self.cached_rto_timeout.lock().unwrap();
+                *cached = None;
             }
 
             // Collect channel info once to avoid locking in the loop
@@ -678,35 +801,41 @@ impl SctpInner {
                     .collect()
             };
 
-            for (tsn, record) in sent_queue.iter_mut() {
-                let expiry = record.sent_time + Duration::from_secs_f64(rto);
-                if now >= expiry {
-                    // Check for abandonment
-                    let mut abandoned = false;
-                    if let Some(Some(max_rexmit)) = channel_info.get(&record.stream_id) {
-                        if record.transmit_count >= *max_rexmit as u32 {
-                            abandoned = true;
-                        }
-                    }
+            let mut current_len: usize = 0;
+            let max_packet_payload = MAX_SCTP_PACKET_SIZE - SCTP_COMMON_HEADER_SIZE;
 
-                    if abandoned {
-                        record.abandoned = true;
-                        if abandoned_tsn.is_none() || *tsn > abandoned_tsn.unwrap() {
-                            abandoned_tsn = Some(*tsn);
-                        }
+            for (tsn, record) in sent_queue.iter_mut() {
+                if record.acked {
+                    continue;
+                }
+
+                // Check for abandonment
+                let mut abandoned = false;
+                if let Some(Some(max_rexmit)) = channel_info.get(&record.stream_id) {
+                    if record.transmit_count >= *max_rexmit as u32 {
+                        abandoned = true;
+                    }
+                }
+
+                if abandoned {
+                    record.abandoned = true;
+                    if abandoned_tsn.is_none() || *tsn > abandoned_tsn.unwrap() {
+                        abandoned_tsn = Some(*tsn);
+                    }
+                } else {
+                    // RFC 4960 Section 6.3.3: Retransmit only the earliest outstanding DATA chunks
+                    // that fit into a single packet of size MTU.
+                    if current_len == 0 || current_len + record.payload.len() <= max_packet_payload
+                    {
+                        to_retransmit.push((*tsn, record.payload.clone()));
+                        current_len += record.payload.len();
+                        record.transmit_count += 1;
+                        record.in_flight = true;
+                        self.flight_size
+                            .fetch_add(record.payload.len(), Ordering::SeqCst);
                     } else {
-                        // RFC 4960 Section 6.3.3: Retransmit only the earliest outstanding DATA chunks
-                        // that fit into a single packet of size MTU.
-                        let current_len: usize = to_retransmit
-                            .iter()
-                            .map(|(_, p): &(u32, Bytes)| p.len())
-                            .sum();
-                        if current_len + record.payload.len() < DEFAULT_MAX_PAYLOAD_SIZE {
-                            to_retransmit.push((*tsn, record.payload.clone()));
-                            record.transmit_count += 1;
-                            record.sent_time = now; // restart timer; don't sample RTT on retransmit
-                            record.fast_retransmit = false; // Reset flag on timeout to allow future fast retransmit if needed
-                        }
+                        // The rest will be handled by drain_retransmissions() as cwnd/rwnd allows.
+                        break;
                     }
                 }
             }
@@ -719,13 +848,15 @@ impl SctpInner {
 
         if !to_retransmit.is_empty() {
             // Backoff RTO once per timer tick
-            let mut rto_state = self.rto_state.lock().unwrap();
-            rto_state.backoff();
-            debug!(
-                "T3-RTX Timeout! Retransmitting {} chunks, New RTO: {}",
-                to_retransmit.len(),
-                rto_state.rto
-            );
+            {
+                let mut rto_state = self.rto_state.lock().unwrap();
+                rto_state.backoff();
+                warn!(
+                    "SCTP RTO Timeout! Backoff RTO to {}s, retransmitting {} head chunks. Flight size reset.",
+                    rto_state.rto,
+                    to_retransmit.len()
+                );
+            }
 
             // Reduce ssthresh and cwnd (RFC 4960 / Modern TCP)
             let cwnd = self.cwnd.load(Ordering::SeqCst);
@@ -733,21 +864,62 @@ impl SctpInner {
             self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
             self.cwnd.store(MAX_SCTP_PACKET_SIZE, Ordering::SeqCst); // Reset to 1 MTU on timeout
             self.partial_bytes_acked.store(0, Ordering::SeqCst);
+            self.fast_recovery_active.store(false, Ordering::SeqCst);
             // Exit Fast Recovery on timeout
             self.fast_recovery_exit_tsn.store(0, Ordering::SeqCst);
-        }
 
-        // 2. Retransmit expired chunks
-        if !to_retransmit.is_empty() {
-            let mut chunks = Vec::new();
-            for (_, data) in to_retransmit {
-                chunks.push(data);
-            }
+            // Retransmit expired chunks
+            let chunks: Vec<Bytes> = to_retransmit.into_iter().map(|(_, p)| p).collect();
             if let Err(e) = self.transmit_chunks(chunks).await {
                 warn!("Failed to retransmit chunks: {}", e);
             }
         }
 
+        // After a timeout or SACK, try to drain any chunks that were marked for retransmission
+        // but couldn't fit in the initial timeout MTU.
+        self.drain_retransmissions().await?;
+
+        Ok(())
+    }
+
+    async fn drain_retransmissions(&self) -> Result<()> {
+        let mut chunks_to_send = Vec::new();
+        let now = Instant::now();
+        {
+            let mut sent_queue = self.sent_queue.lock().unwrap();
+            let cwnd = self.cwnd.load(Ordering::SeqCst);
+            let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
+            let effective_window = cwnd.min(rwnd);
+
+            for record in sent_queue.values_mut() {
+                let flight = self.flight_size.load(Ordering::SeqCst);
+                if flight >= effective_window {
+                    break;
+                }
+
+                if !record.acked && !record.in_flight && !record.abandoned {
+                    record.in_flight = true;
+                    record.transmit_count += 1;
+                    record.sent_time = now;
+                    record.fast_retransmit = false;
+                    let len = record.payload.len();
+                    self.flight_size.fetch_add(len, Ordering::SeqCst);
+                    chunks_to_send.push(record.payload.clone());
+
+                    if chunks_to_send.len() >= 32 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !chunks_to_send.is_empty() {
+            debug!(
+                "Draining {} retransmissions from queue",
+                chunks_to_send.len()
+            );
+            self.transmit_chunks(chunks_to_send).await?;
+        }
         Ok(())
     }
 
@@ -779,6 +951,17 @@ impl SctpInner {
         // Initial TSN
         init_params.put_u32(initial_tsn);
 
+        // Forward TSN (Type 0xC000)
+        init_params.put_u16(0xC000);
+        init_params.put_u16(4);
+
+        // Supported Extensions (Type 0x8008)
+        init_params.put_u16(0x8008);
+        init_params.put_u16(5);
+        init_params.put_u8(0xC0); // Forward TSN
+        init_params.put_u8(0); // Padding
+        init_params.put_u16(0); // Padding to 8 bytes total (4 header + 1 value + 3 padding)
+
         // Optional: Supported Address Types (IPv4)
         init_params.put_u16(12); // Type 12
         init_params.put_u16(6); // Length 6
@@ -803,10 +986,14 @@ impl SctpInner {
         }
 
         let mut buf = packet.clone();
-        let _src_port = buf.get_u16();
-        let _dst_port = buf.get_u16();
+        let src_port = buf.get_u16();
+        let dst_port = buf.get_u16();
         let verification_tag = buf.get_u32();
         let received_checksum = buf.get_u32_le();
+        trace!(
+            "SCTP packet received: src={}, dst={}, vtag={:08x}",
+            src_port, dst_port, verification_tag
+        );
 
         // Verify checksum
         {
@@ -944,6 +1131,17 @@ impl SctpInner {
         self.next_tsn.store(initial_tsn, Ordering::SeqCst);
         init_ack_params.put_u32(initial_tsn);
 
+        // Forward TSN (Type 0xC000)
+        init_ack_params.put_u16(0xC000);
+        init_ack_params.put_u16(4);
+
+        // Supported Extensions (Type 0x8008)
+        init_ack_params.put_u16(0x8008);
+        init_ack_params.put_u16(5);
+        init_ack_params.put_u8(0xC0); // Forward TSN
+        init_ack_params.put_u8(0); // Padding
+        init_ack_params.put_u16(0); // Padding to 4 bytes payload
+
         // State Cookie Parameter (Type 7)
         init_ack_params.put_u16(7);
         init_ack_params.put_u16(4 + cookie.len() as u16);
@@ -1049,12 +1247,15 @@ impl SctpInner {
             let cumulative_tsn_ack = buf.get_u32();
             let a_rwnd = buf.get_u32();
             let num_gap_ack_blocks = buf.get_u16();
-            let _num_duplicate_tsns = buf.get_u16();
+            let num_duplicate_tsns = buf.get_u16();
 
-            let old_rwnd = self.peer_rwnd.swap(a_rwnd, Ordering::SeqCst);
-            if a_rwnd > old_rwnd as u32 {
-                self.flow_control_notify.notify_waiters();
-            }
+            let _old_rwnd = self.peer_rwnd.swap(a_rwnd, Ordering::SeqCst);
+            trace!(
+                "SCTP SACK received: cum_ack={}, a_rwnd={}, gaps={}, dups={}",
+                cumulative_tsn_ack, a_rwnd, num_gap_ack_blocks, num_duplicate_tsns
+            );
+            // Always notify if window might have opened or space was freed
+            self.flow_control_notify.notify_waiters();
 
             let mut gap_blocks = Vec::new();
             for _ in 0..num_gap_ack_blocks {
@@ -1079,8 +1280,12 @@ impl SctpInner {
             }
 
             if outcome.flight_reduction > 0 {
-                self.flight_size
-                    .fetch_sub(outcome.flight_reduction, Ordering::SeqCst);
+                let reduction = outcome.flight_reduction;
+                let _ = self
+                    .flight_size
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |f| {
+                        Some(f.saturating_sub(reduction))
+                    });
 
                 // Congestion Control: Update cwnd
                 let cwnd = self.cwnd.load(Ordering::SeqCst);
@@ -1088,7 +1293,17 @@ impl SctpInner {
 
                 // Check if we are in Fast Recovery
                 let exit_tsn = self.fast_recovery_exit_tsn.load(Ordering::SeqCst);
-                let in_fast_recovery = (cumulative_tsn_ack.wrapping_sub(exit_tsn) as i32) < 0;
+                let was_in_fast_recovery = self.fast_recovery_active.load(Ordering::SeqCst);
+                let in_fast_recovery =
+                    was_in_fast_recovery && (cumulative_tsn_ack.wrapping_sub(exit_tsn) as i32) < 0;
+
+                if was_in_fast_recovery && !in_fast_recovery {
+                    self.fast_recovery_active.store(false, Ordering::SeqCst);
+                    debug!(
+                        "Exiting Fast Recovery! cum_ack: {}, exit_tsn: {}",
+                        cumulative_tsn_ack, exit_tsn
+                    );
+                }
 
                 if in_fast_recovery {
                     // In Fast Recovery, we don't increase cwnd normally.
@@ -1098,7 +1313,12 @@ impl SctpInner {
                         let increase = outcome
                             .bytes_acked_by_cum_tsn
                             .min(MAX_BURST * MAX_SCTP_PACKET_SIZE);
-                        self.cwnd.fetch_add(increase, Ordering::SeqCst);
+                        let old_cwnd = self.cwnd.fetch_add(increase, Ordering::SeqCst);
+                        trace!(
+                            "Congestion Control: Slow Start cwnd increase {} -> {}",
+                            old_cwnd,
+                            old_cwnd + increase
+                        );
                     }
                 } else {
                     // Congestion Avoidance: cwnd += MTU per RTT
@@ -1109,7 +1329,13 @@ impl SctpInner {
                         let total_pba = pba + outcome.bytes_acked_by_cum_tsn;
                         if total_pba >= cwnd {
                             self.partial_bytes_acked.fetch_sub(cwnd, Ordering::SeqCst);
-                            self.cwnd.fetch_add(MAX_SCTP_PACKET_SIZE, Ordering::SeqCst);
+                            let old_cwnd =
+                                self.cwnd.fetch_add(MAX_SCTP_PACKET_SIZE, Ordering::SeqCst);
+                            trace!(
+                                "Congestion Control: Congestion Avoidance cwnd increase {} -> {}",
+                                old_cwnd,
+                                old_cwnd + MAX_SCTP_PACKET_SIZE
+                            );
                         }
                     }
                 }
@@ -1117,7 +1343,7 @@ impl SctpInner {
                 self.flow_control_notify.notify_waiters();
             }
 
-            if outcome.head_moved {
+            if outcome.head_moved || outcome.flight_reduction > 0 {
                 self.timer_notify.notify_one();
                 let mut cached = self.cached_rto_timeout.lock().unwrap();
                 *cached = None;
@@ -1126,7 +1352,9 @@ impl SctpInner {
             // Handle Fast Retransmit
             if !outcome.retransmit.is_empty() {
                 let exit_tsn = self.fast_recovery_exit_tsn.load(Ordering::SeqCst);
-                let in_fast_recovery = (cumulative_tsn_ack.wrapping_sub(exit_tsn) as i32) < 0;
+                let was_in_fast_recovery = self.fast_recovery_active.load(Ordering::SeqCst);
+                let in_fast_recovery =
+                    was_in_fast_recovery && (cumulative_tsn_ack.wrapping_sub(exit_tsn) as i32) < 0;
 
                 if !in_fast_recovery {
                     // Enter Fast Recovery
@@ -1135,24 +1363,30 @@ impl SctpInner {
                     self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
                     self.cwnd.store(new_ssthresh, Ordering::SeqCst);
                     self.partial_bytes_acked.store(0, Ordering::SeqCst);
+                    self.fast_recovery_active.store(true, Ordering::SeqCst);
 
                     // Record the highest TSN currently in flight
                     let highest_tsn = self.next_tsn.load(Ordering::SeqCst).wrapping_sub(1);
                     self.fast_recovery_exit_tsn
                         .store(highest_tsn, Ordering::SeqCst);
 
-                    debug!(
-                        "Entering Fast Recovery! New ssthresh/cwnd: {}, exit_tsn: {}",
-                        new_ssthresh, highest_tsn
+                    warn!(
+                        "Entering Fast Recovery! New ssthresh/cwnd: {}, exit_tsn: {}, retransmitting {} chunks",
+                        new_ssthresh,
+                        highest_tsn,
+                        outcome.retransmit.len()
                     );
                 }
 
-                for (tsn, data) in outcome.retransmit {
-                    if let Err(e) = self.transmit_chunks(vec![data]).await {
-                        warn!("Failed to retransmit TSN {}: {}", tsn, e);
-                    }
+                let chunks: Vec<Bytes> = outcome.retransmit.into_iter().map(|(_, d)| d).collect();
+                if let Err(e) = self.transmit_chunks(chunks).await {
+                    warn!("Failed to retransmit fast recovery chunks: {}", e);
                 }
             }
+
+            // Also check if we should drain any other pending retransmissions
+            // (e.g., chunks lost during an RTO that now fit in the growing cwnd)
+            self.drain_retransmissions().await?;
         }
         Ok(())
     }
@@ -1455,6 +1689,11 @@ impl SctpInner {
         let cumulative_ack = self.cumulative_tsn_ack.load(Ordering::SeqCst);
         let diff = tsn.wrapping_sub(cumulative_ack);
 
+        trace!(
+            "SCTP DATA received: tsn={}, cum_ack={}, flags={:02x}, diff={}",
+            tsn, cumulative_ack, flags, diff as i32
+        );
+
         if diff == 0 || diff > 0x80000000 {
             // Duplicate or Old: record duplicate and schedule fast SACK
             {
@@ -1506,6 +1745,7 @@ impl SctpInner {
         }
 
         if !to_process.is_empty() {
+            trace!("SCTP processing batch of {} data chunks", to_process.len());
             // Collect channel info once to avoid repeated locking
             let channel_map: std::collections::HashMap<u16, Arc<DataChannel>> = {
                 let channels = self.data_channels.lock().unwrap();
@@ -1882,7 +2122,8 @@ impl SctpInner {
         buf[10] = checksum_bytes[2];
         buf[11] = checksum_bytes[3];
 
-        self.dtls_transport.send(buf.freeze()).await
+        let _ = self.outgoing_packet_tx.send(buf.freeze());
+        Ok(())
     }
 
     pub async fn send_data(&self, channel_id: u16, data: &[u8]) -> Result<()> {
@@ -1907,11 +2148,16 @@ impl SctpInner {
                 .find_map(|weak_dc| weak_dc.upgrade().filter(|dc| dc.id == channel_id))
         };
 
+        // Acquire tx_lock to prevent concurrent senders from overshooting the window
+        let _tx_guard = self.tx_lock.lock().await;
+
+        let is_dcep = ppid == DATA_CHANNEL_PPID_DCEP;
+        let mut ordered = !is_dcep;
         let mut max_payload_size = DEFAULT_MAX_PAYLOAD_SIZE;
-        let mut ordered = true;
+
         let (_guard, ssn) = if let Some(dc) = &dc_opt {
             let guard = dc.send_lock.lock().await;
-            ordered = dc.ordered;
+            ordered = if is_dcep { false } else { dc.ordered };
             let ssn = if ordered {
                 dc.next_ssn.fetch_add(1, Ordering::SeqCst)
             } else {
@@ -1923,14 +2169,11 @@ impl SctpInner {
             (None, 0)
         };
 
-        // Flow Control Check
-        // We loop to send data in chunks that fit within the congestion window.
-        // This prevents bursting large messages and flooding the network.
         let total_len = data.len();
+        let flags_base = if !ordered { 0x04 } else { 0x00 };
 
         if total_len == 0 {
             // Send empty packet (unfragmented)
-            // Wait for window space for at least 1 byte/packet
             loop {
                 let flight = self.flight_size.load(Ordering::SeqCst);
                 let cwnd = self.cwnd.load(Ordering::SeqCst);
@@ -1938,18 +2181,23 @@ impl SctpInner {
                 let effective_window = cwnd.min(rwnd);
 
                 if flight >= effective_window {
-                    self.flow_control_notify.notified().await;
+                    let notified = self.flow_control_notify.notified();
+                    // Re-check after registering listener
+                    let flight = self.flight_size.load(Ordering::SeqCst);
+                    let cwnd = self.cwnd.load(Ordering::SeqCst);
+                    let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
+                    let effective_window = cwnd.min(rwnd);
+                    if flight < effective_window {
+                        break;
+                    }
+                    notified.await;
                 } else {
                     break;
                 }
             }
 
             let tsn = self.next_tsn.fetch_add(1, Ordering::SeqCst);
-            let mut flags = 0x03;
-            if !ordered {
-                flags |= 0x04;
-            }
-            let chunk = self.create_data_chunk(channel_id, ppid, data, ssn, flags, tsn);
+            let chunk = self.create_data_chunk(channel_id, ppid, data, ssn, flags_base | 0x03, tsn);
             {
                 let mut queue = self.sent_queue.lock().unwrap();
                 let was_empty = queue.is_empty();
@@ -1961,6 +2209,8 @@ impl SctpInner {
                     stream_id: channel_id,
                     abandoned: false,
                     fast_retransmit: false,
+                    in_flight: true,
+                    acked: false,
                 };
                 queue.insert(tsn, record);
                 self.flight_size.fetch_add(chunk.len(), Ordering::SeqCst);
@@ -1977,25 +2227,39 @@ impl SctpInner {
 
         while offset < total_len {
             // 1. Wait for window space
-            let allowed_bytes;
-            loop {
+            let allowed_bytes = loop {
                 let flight = self.flight_size.load(Ordering::SeqCst);
                 let cwnd = self.cwnd.load(Ordering::SeqCst);
                 let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
                 let effective_window = cwnd.min(rwnd);
 
                 if flight >= effective_window {
-                    self.flow_control_notify.notified().await;
-                } else {
-                    let mut bytes = effective_window - flight;
-                    if bytes == 0 {
-                        // Should not happen if flight < effective_window, but safety check
-                        bytes = max_payload_size;
+                    // RFC 4960 Section 6.2.1: Zero Window Probing.
+                    // If flight is 0 and rwnd is 0, we are allowed to send 1 chunk to probe.
+                    if flight == 0 && rwnd == 0 {
+                        break max_payload_size;
                     }
-                    allowed_bytes = bytes;
-                    break;
+
+                    if flight % 4096 < 1200 {
+                        debug!(
+                            "Flow control: window full (flight={}, cwnd={}, rwnd={})",
+                            flight, cwnd, rwnd
+                        );
+                    }
+                    let notified = self.flow_control_notify.notified();
+                    let flight = self.flight_size.load(Ordering::SeqCst);
+                    let cwnd = self.cwnd.load(Ordering::SeqCst);
+                    let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
+                    let effective_window = cwnd.min(rwnd);
+                    if flight < effective_window {
+                        let bytes = effective_window - flight;
+                        break bytes;
+                    }
+                    notified.await;
+                } else {
+                    break effective_window - flight;
                 }
-            }
+            };
 
             // 2. Create a batch of chunks that fits in the window
             let mut chunks = Vec::new();
@@ -2003,44 +2267,49 @@ impl SctpInner {
 
             while offset < total_len {
                 let remaining = total_len - offset;
-                let chunk_size = std::cmp::min(remaining, max_payload_size);
+                let chunk_payload_size = std::cmp::min(remaining, max_payload_size);
 
-                // Check if we have room in the congestion window
-                let next_chunk_len = 16 + chunk_size; // 16 bytes DATA header
+                let chunk_total_len = {
+                    let chunk_value_len = 12 + chunk_payload_size;
+                    let chunk_len = 4 + chunk_value_len;
+                    let padding = (4 - (chunk_len % 4)) % 4;
+                    chunk_len + padding
+                };
 
                 if !chunks.is_empty() {
-                    // CWND check
-                    if batch_len + next_chunk_len > allowed_bytes {
+                    if batch_len + chunk_total_len > allowed_bytes
+                        || batch_len + chunk_total_len
+                            > MAX_SCTP_PACKET_SIZE - SCTP_COMMON_HEADER_SIZE
+                    {
                         break;
                     }
                 }
 
-                let mut flags = if offset == 0 {
+                let mut flags = flags_base;
+                if offset == 0 {
                     if remaining <= max_payload_size {
-                        0x03 // B=1, E=1 (Unfragmented)
+                        flags |= 0x03; // B=1, E=1
                     } else {
-                        0x02 // B=1, E=0 (First)
+                        flags |= 0x02; // B=1, E=0
                     }
-                } else if offset + chunk_size >= total_len {
-                    0x01 // B=0, E=1 (Last)
+                } else if offset + chunk_payload_size >= total_len {
+                    flags |= 0x01; // B=0, E=1
                 } else {
-                    0x00 // B=0, E=0 (Middle)
-                };
-
-                if !ordered {
-                    flags |= 0x04; // Set U bit
+                    flags |= 0x00; // Middle
                 }
 
                 let tsn = self.next_tsn.fetch_add(1, Ordering::SeqCst);
-                let chunk_data = &data[offset..offset + chunk_size];
+                let chunk_data = &data[offset..offset + chunk_payload_size];
                 let chunk = self.create_data_chunk(channel_id, ppid, chunk_data, ssn, flags, tsn);
 
                 let chunk_len = chunk.len();
                 chunks.push((tsn, chunk));
                 batch_len += chunk_len;
-                offset += chunk_size;
+                offset += chunk_payload_size;
 
-                if batch_len >= allowed_bytes || batch_len >= 64 * 1024 {
+                if batch_len >= allowed_bytes
+                    || batch_len >= MAX_SCTP_PACKET_SIZE - SCTP_COMMON_HEADER_SIZE
+                {
                     break;
                 }
             }
@@ -2060,6 +2329,8 @@ impl SctpInner {
                         stream_id: channel_id,
                         abandoned: false,
                         fast_retransmit: false,
+                        in_flight: true,
+                        acked: false,
                     };
                     queue.insert(*tsn, record);
                     self.flight_size.fetch_add(chunk.len(), Ordering::SeqCst);
@@ -2267,6 +2538,8 @@ mod tests {
                 stream_id: 0,
                 abandoned: false,
                 fast_retransmit: false,
+                in_flight: true,
+                acked: false,
             },
         );
         sent.insert(
@@ -2279,6 +2552,8 @@ mod tests {
                 stream_id: 0,
                 abandoned: false,
                 fast_retransmit: false,
+                in_flight: true,
+                acked: false,
             },
         );
         sent.insert(
@@ -2291,19 +2566,23 @@ mod tests {
                 stream_id: 0,
                 abandoned: false,
                 fast_retransmit: false,
+                in_flight: true,
+                acked: false,
             },
         );
 
         // Ack cumulative 10 and gap-ack 12, leaving 11 outstanding.
         let outcome = apply_sack_to_sent_queue(&mut sent, 10, &[(2, 2)], Instant::now());
 
-        assert_eq!(outcome.flight_reduction, 2); // a + c removed
+        assert_eq!(outcome.flight_reduction, 2); // a cumulative-acked + c gap-acked
         assert_eq!(outcome.rtt_samples.len(), 2);
         assert!(outcome.retransmit.is_empty());
         assert!(outcome.head_moved); // head advanced from 10 to 11
 
-        assert_eq!(sent.len(), 1);
+        assert_eq!(sent.len(), 2); // 11 outstanding, 12 remains (acked) until cumulative ack
         assert!(sent.contains_key(&11));
+        assert!(sent.contains_key(&12));
+        assert!(sent.get(&12).unwrap().acked);
     }
 
     #[test]
@@ -2321,6 +2600,8 @@ mod tests {
                     stream_id: 0,
                     abandoned: false,
                     fast_retransmit: false,
+                    in_flight: true,
+                    acked: false,
                 },
             );
         }
@@ -2331,7 +2612,7 @@ mod tests {
 
         outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now());
         assert_eq!(outcome.retransmit.len(), 0);
-        assert_eq!(sent.len(), 1); // 21 and 23 acked
+        assert_eq!(sent.len(), 2); // 21 removed, 22 and 23 remain (23 acked)
 
         outcome = apply_sack_to_sent_queue(&mut sent, 21, &sack_gap, Instant::now());
         assert_eq!(outcome.retransmit.len(), 0);
@@ -2392,7 +2673,7 @@ mod tests {
 
         let (sctp, _) = SctpTransport::new(
             dtls,
-            mpsc::channel(1).1,
+            mpsc::unbounded_channel().1,
             Arc::new(Mutex::new(Vec::new())),
             5000,
             5000,
@@ -2417,6 +2698,8 @@ mod tests {
                     stream_id: 0,
                     abandoned: false,
                     fast_retransmit: false,
+                    in_flight: true,
+                    acked: false,
                 },
             );
         }

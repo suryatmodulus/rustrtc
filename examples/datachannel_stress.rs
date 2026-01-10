@@ -20,10 +20,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("debug,rustrtc=info")
-        .init();
-
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
     let app = Router::new()
         .route("/", get(index))
         .route("/offer", post(offer))

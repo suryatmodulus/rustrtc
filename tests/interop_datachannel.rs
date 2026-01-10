@@ -13,6 +13,7 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 #[tokio::test]
 async fn interop_datachannel_test() -> Result<()> {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Offerer)
@@ -172,6 +173,8 @@ async fn interop_datachannel_test() -> Result<()> {
 
 #[tokio::test]
 async fn interop_datachannel_dcep_test() -> Result<()> {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Offerer)
@@ -284,6 +287,7 @@ async fn interop_datachannel_dcep_test() -> Result<()> {
 
 #[tokio::test]
 async fn interop_datachannel_incoming_test() -> Result<()> {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
     let _ = env_logger::builder().is_test(true).try_init();
 
     // 1. Create RustRTC PeerConnection (Answerer)

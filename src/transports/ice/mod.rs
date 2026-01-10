@@ -688,6 +688,9 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
             if local.address.ip().is_loopback() && !remote.address.ip().is_loopback() {
                 continue;
             }
+            if local.address.is_ipv4() != remote.address.is_ipv4() {
+                continue;
+            }
             pairs.push(IceCandidatePair::new(local.clone(), remote.clone()));
         }
     }

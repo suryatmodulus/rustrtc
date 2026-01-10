@@ -7,7 +7,7 @@ A high-performance implementation of WebRTC.
 
 ## Features
 
-- **🚀High performance:** ~64% faster than `pion` (go version).
+- **🚀High performance:** ~2.8x faster than `pion` (go version).
 - **🍡WebRTC Compliant**: Full compliance with webrtc/chrome.
 - **📺Media Support**: RTP/SRTP handling for audio and video.
 - **👌ICE/STUN**: Interactive Connectivity Establishment and STUN protocol support.

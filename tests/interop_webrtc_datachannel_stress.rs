@@ -14,6 +14,8 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 #[tokio::test]
 async fn interop_datachannel_stress_test() -> Result<()> {
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider()).ok();
+
     let _ = env_logger::builder().is_test(true).try_init();
     // --- WebRTC Setup (Client/Offerer) ---
     let mut m = MediaEngine::default();

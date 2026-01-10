@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RustRTC DataChannel Stress Test</title>
+    <title>RustRTC Multi-DataChannel Stress Test</title>
     <style>
         body {
             font-family: monospace;
@@ -25,9 +25,10 @@
 </head>
 
 <body>
-    <h1>DataChannel Stress Test</h1>
+    <h1>Multi-DataChannel Stress Test (2 Channels)</h1>
     <div style="margin-bottom: 10px;">
         <label><input type="checkbox" id="usePingPong" checked> Enable Ping-Pong Handshake</label>
+        <label><input type="checkbox" id="multiChannel" checked> Enable Multi-Channel</label>
         <label style="margin-left: 20px;">Chunk Count <input type="text" id="chunkCount" value="256"></label>
         <label style="margin-left: 20px;">Chunk Size <input type="text" id="chunkSize" value="62208"></label>
         <label style="margin-left: 20px;">Backend:
@@ -39,18 +40,25 @@
     </div>
     <div id="status">Status: Ready</div>
     <button id="startBtn" onclick="startTest()">Start Test</button>
-    <div id="stats">
-        Received: <span id="bytesReceived">0</span> / <span id="bytesExpected">1990656</span> bytes
-        (<span id="percent">0</span>%)
+    <div id="stats1">
+        Channel 1: Received: <span id="bytesReceived1">0</span> / <span id="bytesExpected1">0</span> bytes
+        (<span id="percent1">0</span>%)
+    </div>
+    <div id="stats2">
+        Channel 2: Received: <span id="bytesReceived2">0</span> / <span id="bytesExpected2">0</span> bytes
+        (<span id="percent2">0</span>%)
     </div>
     <div id="log"></div>
 
     <script>
 
         let pc;
-        let dc;
-        let bytesReceived = 0;
-        let startTime;
+        let dc1, dc2;
+        let bytesReceived1 = 0;
+        let bytesReceived2 = 0;
+        let startTime1, startTime2;
+        let finished1 = false;
+        let finished2 = false;
 
         function log(msg) {
             const logDiv = document.getElementById('log');
@@ -62,16 +70,73 @@
             document.getElementById('status').innerText = 'Status: ' + status;
         }
 
+        function setupDataChannel(dc, id) {
+            let bytesReceived = 0;
+            let totalExpected = parseInt(document.getElementById('chunkCount').value) * parseInt(document.getElementById('chunkSize').value);
+            let startTime;
+            const usePingPong = document.getElementById('usePingPong').checked;
+
+            document.getElementById(`bytesExpected${id}`).innerText = totalExpected;
+            document.getElementById(`bytesReceived${id}`).innerText = '0';
+            document.getElementById(`percent${id}`).innerText = '0';
+
+            dc.binaryType = 'arraybuffer';
+            dc.onopen = () => {
+                log(`DataChannel ${id} open`);
+                if (usePingPong) {
+                    log(`Sending ping on DC ${id}...`);
+                    dc.send(new TextEncoder().encode('ping'));
+                } else {
+                    startTime = performance.now();
+                    if (id === 1) startTime1 = startTime;
+                    else startTime2 = startTime;
+                }
+            };
+
+            dc.onmessage = (event) => {
+                const data = new Uint8Array(event.data);
+
+                // Check for pong
+                if (usePingPong && data.length === 4 && new TextDecoder().decode(data) === 'pong') {
+                    log(`Received pong on DC ${id}! Starting measurement...`);
+                    startTime = performance.now();
+                    if (id === 1) startTime1 = startTime;
+                    else startTime2 = startTime;
+                    return;
+                }
+
+                bytesReceived += data.length;
+                if (id === 1) bytesReceived1 = bytesReceived;
+                else bytesReceived2 = bytesReceived;
+
+                document.getElementById(`bytesReceived${id}`).innerText = bytesReceived;
+                const percent = (bytesReceived / totalExpected * 100).toFixed(1);
+                document.getElementById(`percent${id}`).innerText = percent;
+
+                if (bytesReceived >= totalExpected) {
+                    const duration = (performance.now() - startTime) / 1000;
+                    const speed = (bytesReceived / 1024 / 1024 / duration).toFixed(2);
+                    log(`Channel ${id} Complete! Received ${bytesReceived} bytes in ${duration.toFixed(2)}s (${speed} MB/s)`);
+
+                    if (id === 1) finished1 = true;
+                    else finished2 = true;
+
+                    if (finished1 && finished2) {
+                        updateStatus('All Completed');
+                        pc.close();
+                        document.getElementById('startBtn').disabled = false;
+                    }
+                }
+            };
+        }
+
         async function startTest() {
             let chunkCount = parseInt(document.getElementById('chunkCount').value);
             let chunkSize = parseInt(document.getElementById('chunkSize').value);
-            let totalExpected = chunkSize * chunkCount;
-            document.getElementById('bytesExpected').innerText = totalExpected;
 
             document.getElementById('startBtn').disabled = true;
-            bytesReceived = 0;
-            document.getElementById('bytesReceived').innerText = '0';
-            document.getElementById('percent').innerText = '0';
+            finished1 = false;
+            finished2 = false;
             document.getElementById('log').innerText = '';
 
             updateStatus('Creating PeerConnection...');
@@ -84,52 +149,23 @@
                 log(`ICE Connection State: ${pc.iceConnectionState}`);
             };
 
-            // Create DataChannel
-            dc = pc.createDataChannel('stress-test');
-            dc.binaryType = 'arraybuffer';
-            dc.onopen = () => {
-                log('DataChannel open');
-                if (usePingPong) {
-                    log('Sending ping...');
-                    dc.send(new TextEncoder().encode('ping'));
-                } else {
-                    updateStatus('Receiving data...');
-                    startTime = performance.now();
-                }
-            };
-            dc.onmessage = (event) => {
-                const data = new Uint8Array(event.data);
+            // Create DataChannels
+            dc1 = pc.createDataChannel('stress-test-1');
+            setupDataChannel(dc1, 1);
 
-                // Check for pong
-                if (usePingPong && data.length === 4 && new TextDecoder().decode(data) === 'pong') {
-                    log('Received pong! Starting measurement...');
-                    updateStatus('Receiving data...');
-                    startTime = performance.now();
-                    return;
-                }
-
-                bytesReceived += data.length;
-
-                document.getElementById('bytesReceived').innerText = bytesReceived;
-                const percent = (bytesReceived / totalExpected * 100).toFixed(1);
-                document.getElementById('percent').innerText = percent;
-
-                if (bytesReceived >= totalExpected) {
-                    const duration = (performance.now() - startTime) / 1000;
-                    const speed = (bytesReceived / 1024 / 1024 / duration).toFixed(2);
-                    log(`Test Complete! Received ${bytesReceived} bytes in ${duration.toFixed(2)}s (${speed} MB/s)`);
-                    updateStatus('Completed');
-                    dc.close();
-                    pc.close();
-                    document.getElementById('startBtn').disabled = false;
-                }
-            };
+            if (document.getElementById('multiChannel').checked) {
+                dc2 = pc.createDataChannel('stress-test-2');
+                setupDataChannel(dc2, 2);
+            } else {
+                finished2 = true;
+                dc2 = null;
+            }
 
             // Create Offer
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
 
-            // Wait for ICE gathering to complete (simple approach)
+            // Wait for ICE gathering to complete
             await new Promise(resolve => {
                 if (pc.iceGatheringState === 'complete') {
                     resolve();

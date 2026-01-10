@@ -64,7 +64,9 @@ pub fn get_client_hello_extensions() -> Vec<u8> {
     // Use SRTP (Type 14)
     // Length: 7 (2 profiles * 2 bytes + 2 bytes list length + 1 byte MKI length)
     // Profiles: 0x0007 (AEAD_AES_128_GCM), 0x0001 (AES_CM_128_HMAC_SHA1_80)
-    extensions.extend_from_slice(&[0x00, 0x0e, 0x00, 0x07, 0x00, 0x04, 0x00, 0x07, 0x00, 0x01, 0x00]);
+    extensions.extend_from_slice(&[
+        0x00, 0x0e, 0x00, 0x07, 0x00, 0x04, 0x00, 0x07, 0x00, 0x01, 0x00,
+    ]);
 
     // Supported Elliptic Curves (Type 10) - secp256r1
     extensions.extend_from_slice(&[0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17]);
@@ -166,13 +168,13 @@ impl DtlsTransport {
         conn: Arc<IceConn>,
         certificate: Certificate,
         is_client: bool,
-        buffer_size: usize,
+        _buffer_size: usize,
     ) -> Result<(
         Arc<Self>,
-        mpsc::Receiver<Bytes>,
+        mpsc::UnboundedReceiver<Bytes>,
         impl std::future::Future<Output = ()> + Send,
     )> {
-        let (incoming_data_tx, incoming_data_rx) = mpsc::channel(buffer_size);
+        let (incoming_data_tx, incoming_data_rx) = mpsc::unbounded_channel();
         let (handshake_rx_feeder, handshake_rx) = mpsc::channel(2000);
         let (state_tx, state_rx) = tokio::sync::watch::channel(DtlsState::New);
 
@@ -330,6 +332,9 @@ impl Drop for DtlsTransport {
 
 impl DtlsInner {
     async fn handle_retransmit(&self, ctx: &HandshakeContext, _is_client: bool) {
+        if *self.state.lock().unwrap() != DtlsState::Handshaking {
+            return;
+        }
         if let Some(buf) = &ctx.last_flight_buffer {
             if let Err(e) = self.conn.send(buf).await {
                 if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
@@ -357,7 +362,7 @@ impl DtlsInner {
         &self,
         packet: Bytes,
         ctx: &mut HandshakeContext,
-        incoming_data_tx: &mpsc::Sender<Bytes>,
+        incoming_data_tx: &mpsc::UnboundedSender<Bytes>,
         certificate: &Certificate,
         is_client: bool,
     ) -> Result<()> {
@@ -475,7 +480,7 @@ impl DtlsInner {
         content_type: ContentType,
         payload: Bytes,
         ctx: &mut HandshakeContext,
-        incoming_data_tx: &mpsc::Sender<Bytes>,
+        incoming_data_tx: &mpsc::UnboundedSender<Bytes>,
         certificate: &Certificate,
         is_client: bool,
     ) -> Result<()> {
@@ -485,9 +490,7 @@ impl DtlsInner {
                 // TODO: Switch to encrypted mode
             }
             ContentType::ApplicationData => {
-                if let Err(e) = incoming_data_tx.send(payload).await {
-                    warn!("Failed to send incoming data to channel: {}", e);
-                }
+                let _ = incoming_data_tx.send(payload);
             }
             ContentType::Handshake => {
                 self.process_handshake_payload(payload, ctx, certificate, is_client)
@@ -772,8 +775,7 @@ impl DtlsInner {
 
         // Generate new Session ID to force full handshake
         let mut session_id = vec![0u8; 32];
-        use rand_core::RngCore;
-        OsRng.fill_bytes(&mut session_id);
+        rand::fill(&mut session_id[..]);
 
         let server_hello = ServerHello {
             version: ProtocolVersion::DTLS_1_2,
@@ -1076,6 +1078,8 @@ impl DtlsInner {
             // Add Client's Finished to transcript
             ctx.handshake_messages.extend_from_slice(raw_msg);
 
+            let mut flight_buffer = Vec::new();
+
             // Send ChangeCipherSpec
             let record = DtlsRecord {
                 content_type: ContentType::ChangeCipherSpec,
@@ -1089,6 +1093,7 @@ impl DtlsInner {
             let mut buf = BytesMut::new();
             record.encode(&mut buf);
             self.conn.send(&buf).await?;
+            flight_buffer.extend_from_slice(&buf);
 
             ctx.epoch += 1;
             ctx.sequence_number = 0;
@@ -1122,14 +1127,17 @@ impl DtlsInner {
             handshake_msg.encode(&mut buf);
             ctx.handshake_messages.extend_from_slice(&buf);
 
-            self.send_handshake_message(
-                handshake_msg,
-                ctx.epoch,
-                &mut ctx.sequence_number,
-                ctx.session_keys.as_ref(),
-                is_client,
-            )
-            .await?;
+            let buf = self
+                .send_handshake_message(
+                    handshake_msg,
+                    ctx.epoch,
+                    &mut ctx.sequence_number,
+                    ctx.session_keys.as_ref(),
+                    is_client,
+                )
+                .await?;
+            flight_buffer.extend_from_slice(&buf);
+            ctx.last_flight_buffer = Some(flight_buffer);
             // message_seq += 1; // End of handshake
 
             if let Some(keys) = &ctx.session_keys {
@@ -1235,14 +1243,16 @@ impl DtlsInner {
             handshake_msg.encode(&mut buf);
             ctx.handshake_messages.extend_from_slice(&buf);
 
-            self.send_handshake_message(
-                handshake_msg,
-                ctx.epoch,
-                &mut ctx.sequence_number,
-                None,
-                is_client,
-            )
-            .await?;
+            let buf = self
+                .send_handshake_message(
+                    handshake_msg,
+                    ctx.epoch,
+                    &mut ctx.sequence_number,
+                    None,
+                    is_client,
+                )
+                .await?;
+            ctx.last_flight_buffer = Some(buf);
             ctx.message_seq += 1;
         }
         Ok(())
@@ -1413,6 +1423,8 @@ impl DtlsInner {
         ctx.session_crypto = Some(create_session_crypto(keys.clone())?);
         ctx.session_keys = Some(keys);
 
+        let mut flight_buffer = Vec::new();
+
         // Send ChangeCipherSpec
         let record = DtlsRecord {
             content_type: ContentType::ChangeCipherSpec,
@@ -1425,6 +1437,7 @@ impl DtlsInner {
         let mut buf = BytesMut::new();
         record.encode(&mut buf);
         self.conn.send(&buf).await?;
+        flight_buffer.extend_from_slice(&buf);
 
         ctx.epoch += 1;
         ctx.sequence_number = 0;
@@ -1451,14 +1464,17 @@ impl DtlsInner {
         handshake_msg.encode(&mut buf);
         ctx.handshake_messages.extend_from_slice(&buf);
 
-        self.send_handshake_message(
-            handshake_msg,
-            ctx.epoch,
-            &mut ctx.sequence_number,
-            ctx.session_keys.as_ref(),
-            is_client,
-        )
-        .await?;
+        let buf = self
+            .send_handshake_message(
+                handshake_msg,
+                ctx.epoch,
+                &mut ctx.sequence_number,
+                ctx.session_keys.as_ref(),
+                is_client,
+            )
+            .await?;
+        flight_buffer.extend_from_slice(&buf);
+        ctx.last_flight_buffer = Some(flight_buffer);
         ctx.message_seq += 1;
 
         Ok(())
@@ -1467,7 +1483,7 @@ impl DtlsInner {
         &self,
         certificate: Certificate,
         is_client: bool,
-        incoming_data_tx: mpsc::Sender<Bytes>,
+        incoming_data_tx: mpsc::UnboundedSender<Bytes>,
         mut handshake_rx: mpsc::Receiver<Bytes>,
         close_rx: Arc<tokio::sync::Notify>,
     ) -> Result<()> {

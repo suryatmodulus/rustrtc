@@ -15,7 +15,6 @@ use crate::{
     RtcError, RtcResult, SdpType, SessionDescription, TransportMode, VideoCapability,
 };
 use base64::prelude::*;
-use rand_core::{OsRng, RngCore};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::{
@@ -283,7 +282,7 @@ struct PeerConnectionInner {
 
 fn generate_sdes_key_params() -> String {
     let mut key_salt = [0u8; 30];
-    OsRng.fill_bytes(&mut key_salt);
+    rand::fill(&mut key_salt);
     let encoded = BASE64_STANDARD.encode(&key_salt);
     format!("inline:{}", encoded)
 }
