@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use tracing::debug;
 
 pub struct RtpTransport {
     transport: Arc<IceConn>,
@@ -282,7 +283,7 @@ impl PacketReceiver for RtpTransport {
                     if listener.is_none() {
                         let mut provisional = self.provisional_listener.lock().unwrap();
                         if let Some(tx) = provisional.take() {
-                            tracing::info!("RTP binding provisional listener to SSRC: {}", ssrc);
+                            debug!("RTP binding provisional listener to SSRC: {}", ssrc);
                             let mut listeners = self.listeners.lock().unwrap();
                             listeners.insert(ssrc, tx.clone());
                             listener = Some(tx);

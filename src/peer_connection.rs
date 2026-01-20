@@ -3030,7 +3030,7 @@ impl RtpTransceiver {
             // If transport is already established, connect the sender to it
             if let Some(weak_transport) = self.rtp_transport.lock().unwrap().as_ref() {
                 if let Some(transport) = weak_transport.upgrade() {
-                    tracing::info!(
+                    debug!(
                         "set_sender: connecting late sender ssrc={} to existing transport",
                         s.ssrc()
                     );
@@ -3373,20 +3373,6 @@ impl RtpSender {
 
                                 for interceptor in &interceptors {
                                     interceptor.on_packet_sent(&packet).await;
-                                }
-
-                                if packet.header.payload_type == 8 {
-                                    if packet.header.sequence_number % 50 == 0 || packet.header.marker {
-                                        tracing::info!("RTP_TRACE ssrc={} seq={} ts={} offset={} len={} m={} x={}",
-                                            packet.header.ssrc,
-                                            packet.header.sequence_number,
-                                            packet.header.timestamp,
-                                            timestamp_offset,
-                                            packet.payload.len(),
-                                            packet.header.marker,
-                                            packet.header.extension.is_some()
-                                        );
-                                    }
                                 }
 
                                 if let Err(e) = transport.send_rtp(&packet).await {

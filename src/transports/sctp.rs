@@ -747,7 +747,7 @@ impl SctpInner {
                 }
             }
         }
-        info!("SctpTransport run_loop finished");
+        debug!("SctpTransport run_loop finished");
     }
 
     async fn handle_timeout(&self) -> Result<()> {
@@ -873,7 +873,7 @@ impl SctpInner {
             {
                 let mut rto_state = self.rto_state.lock().unwrap();
                 rto_state.backoff();
-                info!(
+                debug!(
                     "SCTP RTO Timeout! Backoff RTO to {}s, retransmitting {} head chunks. Flight size reset.",
                     rto_state.rto,
                     to_retransmit.len()
@@ -1080,17 +1080,17 @@ impl SctpInner {
                 CT_FORWARD_TSN => self.handle_forward_tsn(chunk_value).await?,
                 CT_RECONFIG => self.handle_reconfig(chunk_value).await?,
                 CT_ABORT => {
-                    info!("SCTP ABORT received");
+                    debug!("SCTP ABORT received");
                     self.set_state(SctpState::Closed);
                 }
                 CT_SHUTDOWN => {
-                    info!("SCTP SHUTDOWN received");
+                    debug!("SCTP SHUTDOWN received");
                     let tag = self.remote_verification_tag.load(Ordering::SeqCst);
                     self.send_chunk(CT_SHUTDOWN_ACK, 0, Bytes::new(), tag)
                         .await?;
                 }
                 CT_SHUTDOWN_ACK => {
-                    info!("SCTP SHUTDOWN ACK received");
+                    debug!("SCTP SHUTDOWN ACK received");
                     self.set_state(SctpState::Closed);
                 }
                 _ => {
@@ -1402,7 +1402,7 @@ impl SctpInner {
 
                 let chunks: Vec<Bytes> = outcome.retransmit.into_iter().map(|(_, d)| d).collect();
                 if let Err(e) = self.transmit_chunks(chunks).await {
-                    info!("Failed to retransmit fast recovery chunks: {}", e);
+                    debug!("Failed to retransmit fast recovery chunks: {}", e);
                 }
             }
 
@@ -1543,7 +1543,7 @@ impl SctpInner {
                 if let Some(dc) = weak_dc.upgrade() {
                     if streams.is_empty() || streams.contains(&dc.id) {
                         dc.next_ssn.store(0, Ordering::SeqCst);
-                        info!("Reset SSN for stream {}", dc.id);
+                        debug!("Reset SSN for stream {}", dc.id);
                     }
                 }
             }
@@ -1560,7 +1560,7 @@ impl SctpInner {
         }
         let response_sn = buf.get_u32();
         let result = buf.get_u32();
-        info!(
+        debug!(
             "Received RE-CONFIG response for SN {}, result: {}",
             response_sn, result
         );
