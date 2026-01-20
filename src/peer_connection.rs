@@ -223,7 +223,7 @@ impl NackStats for DefaultRtpReceiverNackHandler {
 enum ReceiverCommand {
     AddTrack {
         rid: Option<String>,
-        packet_rx: mpsc::Receiver<crate::rtp::RtpPacket>,
+        packet_rx: mpsc::Receiver<(crate::rtp::RtpPacket, std::net::SocketAddr)>,
         feedback_rx:
             std::sync::Arc<tokio::sync::Mutex<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
         source: std::sync::Arc<crate::media::track::SampleStreamSource>,
@@ -233,9 +233,9 @@ enum ReceiverCommand {
 
 enum LoopEvent {
     Packet(
-        Option<crate::rtp::RtpPacket>,
+        Option<(crate::rtp::RtpPacket, std::net::SocketAddr)>,
         Option<String>,
-        mpsc::Receiver<crate::rtp::RtpPacket>,
+        mpsc::Receiver<(crate::rtp::RtpPacket, std::net::SocketAddr)>,
     ),
     Feedback(Option<crate::media::track::FeedbackEvent>, Option<String>),
 }
@@ -3440,7 +3440,7 @@ pub struct RtpReceiver {
     ssrc: Mutex<u32>,
     params: Mutex<RtpCodecParameters>,
     transport: Mutex<Option<Arc<RtpTransport>>>,
-    packet_tx: Mutex<Option<mpsc::Sender<RtpPacket>>>,
+    packet_tx: Mutex<Option<mpsc::Sender<(crate::rtp::RtpPacket, std::net::SocketAddr)>>>,
     rtcp_feedback_ssrc: Mutex<Option<u32>>,
     rtx_ssrc: Mutex<Option<u32>>,
     fir_seq: AtomicU8,
@@ -3634,7 +3634,7 @@ impl RtpReceiver {
         *self.ssrc.lock().unwrap()
     }
 
-    pub fn packet_tx(&self) -> Option<mpsc::Sender<RtpPacket>> {
+    pub fn packet_tx(&self) -> Option<mpsc::Sender<(crate::rtp::RtpPacket, std::net::SocketAddr)>> {
         self.packet_tx.lock().unwrap().clone()
     }
 
@@ -3781,7 +3781,7 @@ impl RtpReceiver {
                     if let Some(event) = event {
                         match event {
                             LoopEvent::Packet(packet_opt, rid, packet_rx) => {
-                                if let Some(packet) = packet_opt {
+                                if let Some((packet, addr)) = packet_opt {
                                     if let Some((source, simulcast_ssrc, _)) = tracks.get(&rid) {
                                         if rid.is_some() {
                                             let mut s = simulcast_ssrc.lock().unwrap();
@@ -3826,6 +3826,7 @@ impl RtpReceiver {
                                                 packet,
                                                 source.kind(),
                                                 params.clock_rate,
+                                                addr,
                                             );
                                             if let Ok(_) = source.send(sample).await {
                                                 let rid_clone = rid.clone();

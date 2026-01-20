@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
 use crate::rtp::{RtpHeader, RtpHeaderExtension, RtpPacket};
 
@@ -27,6 +28,10 @@ pub struct AudioFrame {
     pub sequence_number: Option<u16>,
     pub payload_type: Option<u8>,
     pub marker: bool,
+    #[serde(skip)]
+    pub source_addr: Option<SocketAddr>,
+    #[serde(skip)]
+    pub raw_packet: Option<RtpPacket>,
 }
 
 impl Default for AudioFrame {
@@ -38,6 +43,8 @@ impl Default for AudioFrame {
             sequence_number: None,
             payload_type: None,
             marker: false,
+            source_addr: None,
+            raw_packet: None,
         }
     }
 }
@@ -55,6 +62,10 @@ pub struct VideoFrame {
     pub csrcs: Vec<u32>,
     pub sequence_number: Option<u16>,
     pub payload_type: Option<u8>,
+    #[serde(skip)]
+    pub source_addr: Option<SocketAddr>,
+    #[serde(skip)]
+    pub raw_packet: Option<RtpPacket>,
 }
 
 impl Default for VideoFrame {
@@ -71,6 +82,8 @@ impl Default for VideoFrame {
             csrcs: Vec::new(),
             sequence_number: None,
             payload_type: None,
+            source_addr: None,
+            raw_packet: None,
         }
     }
 }
@@ -130,7 +143,13 @@ impl MediaSample {
         RtpPacket::new(header, payload.to_vec())
     }
 
-    pub fn from_rtp_packet(packet: RtpPacket, kind: MediaKind, clock_rate: u32) -> Self {
+    pub fn from_rtp_packet(
+        packet: RtpPacket,
+        kind: MediaKind,
+        clock_rate: u32,
+        addr: SocketAddr,
+    ) -> Self {
+        let raw_packet = packet.clone();
         let data = bytes::Bytes::from(packet.payload);
 
         match kind {
@@ -141,6 +160,8 @@ impl MediaSample {
                 sequence_number: Some(packet.header.sequence_number),
                 payload_type: Some(packet.header.payload_type),
                 marker: packet.header.marker,
+                source_addr: Some(addr),
+                raw_packet: Some(raw_packet),
             }),
             MediaKind::Video => MediaSample::Video(VideoFrame {
                 rtp_timestamp: packet.header.timestamp,
@@ -154,6 +175,8 @@ impl MediaSample {
                 csrcs: packet.header.csrcs,
                 sequence_number: Some(packet.header.sequence_number),
                 payload_type: Some(packet.header.payload_type),
+                source_addr: Some(addr),
+                raw_packet: Some(raw_packet),
             }),
         }
     }

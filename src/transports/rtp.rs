@@ -14,11 +14,11 @@ use tracing::debug;
 pub struct RtpTransport {
     transport: Arc<IceConn>,
     srtp_session: Mutex<Option<Arc<Mutex<SrtpSession>>>>,
-    listeners: Mutex<HashMap<u32, mpsc::Sender<RtpPacket>>>,
+    listeners: Mutex<HashMap<u32, mpsc::Sender<(RtpPacket, SocketAddr)>>>,
     rtcp_listener: Mutex<Option<mpsc::Sender<Vec<RtcpPacket>>>>,
-    rid_listeners: Mutex<HashMap<String, mpsc::Sender<RtpPacket>>>,
-    pt_listeners: Mutex<HashMap<u8, mpsc::Sender<RtpPacket>>>,
-    provisional_listener: Mutex<Option<mpsc::Sender<RtpPacket>>>,
+    rid_listeners: Mutex<HashMap<String, mpsc::Sender<(RtpPacket, SocketAddr)>>>,
+    pt_listeners: Mutex<HashMap<u8, mpsc::Sender<(RtpPacket, SocketAddr)>>>,
+    provisional_listener: Mutex<Option<mpsc::Sender<(RtpPacket, SocketAddr)>>>,
     rid_extension_id: Mutex<Option<u8>>,
     abs_send_time_extension_id: Mutex<Option<u8>>,
     srtp_required: bool,
@@ -49,7 +49,7 @@ impl RtpTransport {
         *session = Some(Arc::new(Mutex::new(srtp_session)));
     }
 
-    pub fn register_listener_sync(&self, ssrc: u32, tx: mpsc::Sender<RtpPacket>) {
+    pub fn register_listener_sync(&self, ssrc: u32, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.listeners.lock().unwrap();
         listeners.insert(ssrc, tx);
     }
@@ -59,17 +59,17 @@ impl RtpTransport {
         listeners.contains_key(&ssrc)
     }
 
-    pub fn register_rid_listener(&self, rid: String, tx: mpsc::Sender<RtpPacket>) {
+    pub fn register_rid_listener(&self, rid: String, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.rid_listeners.lock().unwrap();
         listeners.insert(rid, tx);
     }
 
-    pub fn register_pt_listener(&self, pt: u8, tx: mpsc::Sender<RtpPacket>) {
+    pub fn register_pt_listener(&self, pt: u8, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listeners = self.pt_listeners.lock().unwrap();
         listeners.insert(pt, tx);
     }
 
-    pub fn register_provisional_listener(&self, tx: mpsc::Sender<RtpPacket>) {
+    pub fn register_provisional_listener(&self, tx: mpsc::Sender<(RtpPacket, SocketAddr)>) {
         let mut listener = self.provisional_listener.lock().unwrap();
         *listener = Some(tx);
     }
@@ -194,7 +194,7 @@ impl RtpTransport {
 
 #[async_trait]
 impl PacketReceiver for RtpTransport {
-    async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
+    async fn receive(&self, packet: Bytes, addr: SocketAddr) {
         let is_rtcp_packet = is_rtcp(&packet);
 
         let unprotected = {
@@ -305,7 +305,7 @@ impl PacketReceiver for RtpTransport {
                     }
 
                     if let Some(tx) = listener {
-                        if tx.send(rtp_packet).await.is_err() {
+                        if tx.send((rtp_packet, addr)).await.is_err() {
                             // Only remove SSRC listener if we used it?
                             // If we used RID listener, we shouldn't remove SSRC listener.
                             // But here we don't know which one we used easily without a flag.
@@ -371,7 +371,7 @@ mod tests {
             .recv()
             .await
             .expect("Packet should be received by provisional listener");
-        assert_eq!(received.header.ssrc, ssrc);
+        assert_eq!(received.0.header.ssrc, ssrc);
 
         // 2. Verify SSRC is now bound
         assert!(
@@ -400,7 +400,7 @@ mod tests {
             .recv()
             .await
             .expect("Second packet should be received via bound SSRC");
-        assert_eq!(received2.header.ssrc, ssrc);
-        assert_eq!(received2.payload[0], 1);
+        assert_eq!(received2.0.header.ssrc, ssrc);
+        assert_eq!(received2.0.payload[0], 1);
     }
 }

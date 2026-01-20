@@ -525,13 +525,7 @@ mod tests {
             width: 640,
             height: 480,
             format: VideoPixelFormat::Rgba,
-            rotation_deg: 0,
-            is_last_packet: false,
-            data: Bytes::new(),
-            header_extension: None,
-            csrcs: Vec::new(),
-            sequence_number: None,
-            payload_type: None,
+            ..Default::default()
         };
         let err = source.send_video(video).await.unwrap_err();
         assert!(matches!(err, MediaError::KindMismatch { .. }));
@@ -556,9 +550,7 @@ mod tests {
             rtp_timestamp: 0,
             clock_rate: 48_000,
             data: Bytes::from_static(&[1u8; 4]),
-            sequence_number: None,
-            payload_type: None,
-            marker: false,
+            ..Default::default()
         };
         source.send_audio(frame.clone()).await.unwrap();
 

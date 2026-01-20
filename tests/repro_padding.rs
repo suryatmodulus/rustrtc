@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use rustrtc::media::MediaStreamTrack;
-use rustrtc::media::frame::{MediaSample, VideoFrame, VideoPixelFormat};
+use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::{MediaKind, RtcConfiguration};
 use rustrtc::{PeerConnection, TransceiverDirection};
 use std::time::Duration;
@@ -109,16 +109,8 @@ async fn test_padding_packet_drop() -> Result<()> {
     println!("Sending P1");
     let f1 = VideoFrame {
         rtp_timestamp: 1000,
-        width: 0,
-        height: 0,
-        format: VideoPixelFormat::Unspecified,
-        rotation_deg: 0,
-        is_last_packet: false,
         data: Bytes::from(vec![0x90, 0x80, 0x01]),
-        header_extension: None,
-        csrcs: Vec::new(),
-        sequence_number: None,
-        payload_type: None,
+        ..Default::default()
     };
     client_source.send_video(f1).await?;
     println!("Sent P1");
@@ -127,16 +119,8 @@ async fn test_padding_packet_drop() -> Result<()> {
     println!("Sending P2");
     let f2 = VideoFrame {
         rtp_timestamp: 1000,
-        width: 0,
-        height: 0,
-        format: VideoPixelFormat::Unspecified,
-        rotation_deg: 0,
-        is_last_packet: false,
         data: Bytes::new(), // Empty
-        header_extension: None,
-        csrcs: Vec::new(),
-        sequence_number: None,
-        payload_type: None,
+        ..Default::default()
     };
     client_source.send_video(f2).await?;
     println!("Sent P2");
@@ -145,16 +129,9 @@ async fn test_padding_packet_drop() -> Result<()> {
     println!("Sending P3");
     let f3 = VideoFrame {
         rtp_timestamp: 4000,
-        width: 0,
-        height: 0,
-        format: VideoPixelFormat::Unspecified,
-        rotation_deg: 0,
+        data: Bytes::from(vec![0x90, 0x80, 0x01]), // valid
         is_last_packet: true,
-        data: Bytes::from(vec![0x90, 0x80, 0x02]),
-        header_extension: None,
-        csrcs: Vec::new(),
-        sequence_number: None,
-        payload_type: None,
+        ..Default::default()
     };
     client_source.send_video(f3).await?;
     println!("Sent P3");
