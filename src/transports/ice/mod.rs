@@ -837,7 +837,11 @@ async fn handle_packet(
                         {
                             let selected_pair = inner.selected_pair.lock().unwrap();
                             if let Some(pair) = selected_pair.as_ref() {
-                                if pair.remote.address != addr {
+                                if pair.remote.address != addr
+                                    && msg.method == StunMethod::Binding
+                                    && pair.remote.address.port() == addr.port()
+                                // Match port only
+                                {
                                     debug!(
                                         "RTP Latching: Switching remote address from {} to {} based on STUN Binding Request",
                                         pair.remote.address, addr

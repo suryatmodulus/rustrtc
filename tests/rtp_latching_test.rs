@@ -1,7 +1,9 @@
 use anyhow::Result;
+use network_interface::{NetworkInterface, NetworkInterfaceConfig};
 use rustrtc::media::frame::{MediaSample, VideoFrame};
 use rustrtc::transports::ice::stun::StunMessage;
 use rustrtc::{PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType, TransportMode};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,11 +13,38 @@ use tokio::net::UdpSocket;
 async fn test_rtp_latching() -> Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
+    // 0. Find distinct local IPs
+    let interfaces = NetworkInterface::show().unwrap();
+    let mut ips = HashSet::new();
+    for itf in interfaces {
+        for addr in itf.addr {
+            let ip = addr.ip();
+            if ip.is_ipv4() && !ip.is_multicast() && !ip.is_unspecified() {
+                // Try to bind to it to see if it's usable
+                if std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok() {
+                    ips.insert(ip);
+                }
+            }
+        }
+    }
+
+    if ips.len() < 2 {
+        println!(
+            "Skipping test_rtp_latching: Need at least 2 distinct local IPv4s, found {:?}",
+            ips
+        );
+        return Ok(());
+    }
+
+    let ips: Vec<_> = ips.into_iter().collect();
+    let ip1 = ips[0];
+    let ip2 = ips[1];
+
     // 1. Setup PeerConnection (PC) with RTP Mode & Latching
     let mut config = RtcConfiguration::default();
     config.transport_mode = TransportMode::Rtp;
     config.enable_latching = true;
-    config.bind_ip = Some("127.0.0.1".to_string());
+    config.bind_ip = Some("0.0.0.0".to_string());
     config.rtp_start_port = Some(40000);
     config.rtp_end_port = Some(40100);
     let pc = PeerConnection::new(config);
@@ -32,7 +61,7 @@ async fn test_rtp_latching() -> Result<()> {
     let _sender = pc.add_track(track.clone(), params.clone())?;
 
     // 2. Prepare Remote (Initial)
-    let socket1 = UdpSocket::bind("127.0.0.1:0").await?;
+    let socket1 = UdpSocket::bind(SocketAddr::new(ip1, 0)).await?;
     let addr1 = socket1.local_addr()?;
     println!("Remote 1 (Initial) at {}", addr1);
 
@@ -92,9 +121,18 @@ async fn test_rtp_latching() -> Result<()> {
     println!("Received packet on addr1, len={}", len);
     assert!(len > 0);
 
-    // 5. Migrate to addr2
-    let socket2 = UdpSocket::bind("127.0.0.1:0").await?;
-    let addr2 = socket2.local_addr()?;
+    // 5. Migrate to addr2 (Different IP, SAME port)
+    let addr2 = SocketAddr::new(ip2, addr1.port());
+    let socket2 = match UdpSocket::bind(addr2).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!(
+                "Skipping test: Could not bind another socket to same port on different IP ({}): {}",
+                addr2, e
+            );
+            return Ok(());
+        }
+    };
     println!("Remote 2 (Migrated) at {}", addr2);
 
     // Retrieve PC's listening address
@@ -104,7 +142,8 @@ async fn test_rtp_latching() -> Result<()> {
     if pc_port == 0 {
         panic!("PC port is 0, gathering failed?");
     }
-    let pc_addr: SocketAddr = format!("127.0.0.1:{}", pc_port).parse()?;
+    // Since PC is bound to 0.0.0.0, it should be reachable on all local IPs
+    let pc_addr: SocketAddr = SocketAddr::new(ip1, pc_port);
     println!("PC listening at {}", pc_addr);
 
     // Send STUN Binding Request from socket2 to PC to trigger latching
@@ -159,9 +198,27 @@ async fn test_rtp_latching() -> Result<()> {
         "Failed to receive RTP on new address after latching"
     );
 
-    // Also verify we stop receiving on addr1? (Optional, but nice)
-    // Actually PC might continue sending to old address for a split second, updating is async.
-    // But eventually it should switch.
+    // 7. Verify that different port DOES NOT latch
+    let socket3 = UdpSocket::bind(SocketAddr::new(ip2, 0)).await?;
+    let addr3 = socket3.local_addr()?;
+    println!("Remote 3 (Different Port) at {}", addr3);
+
+    // Send STUN Binding Request from socket3 to PC
+    println!("Sending STUN Binding Request from {} to {}", addr3, pc_addr);
+    socket3.send_to(&req_bytes, pc_addr).await?;
+
+    // Wait and verify we DO NOT receive RTP on socket3
+    println!("Verifying no RTP on socket3 (different port)...");
+    match tokio::time::timeout(Duration::from_secs(2), socket3.recv_from(&mut buf)).await {
+        Ok(Ok((_len, _))) => {
+            if (buf[0] & 0xC0) == 0x80 {
+                panic!("RTP should NOT have latched to different port!");
+            }
+        }
+        _ => {
+            println!("Correctly did not latch to different port");
+        }
+    }
 
     Ok(())
 }

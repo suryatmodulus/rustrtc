@@ -279,7 +279,7 @@ impl Default for RtcConfiguration {
             dtls_buffer_size: 2048,
             rtp_start_port: None,
             rtp_end_port: None,
-            enable_latching: true,
+            enable_latching: false,
         }
     }
 }
