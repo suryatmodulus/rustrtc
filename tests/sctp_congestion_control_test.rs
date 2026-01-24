@@ -29,8 +29,8 @@ impl CongestionControl {
         let cwnd = self.cwnd.load(Ordering::SeqCst);
         let new_ssthresh = (cwnd / 2).max(SSTHRESH_MIN);
         self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
-        // RFC 4960: Set cwnd to 1*MTU for most conservative restart
-        let new_cwnd = MTU;
+        // Set cwnd to 2*MTU for better recovery while still conservative
+        let new_cwnd = MTU * 2;
         self.cwnd.store(new_cwnd, Ordering::SeqCst);
         self.partial_bytes_acked.store(0, Ordering::SeqCst);
         self.flight_size.store(0, Ordering::SeqCst); // Important: reset flight size
@@ -104,10 +104,10 @@ fn test_congestion_control_rto_timeout() {
     // Simulate RTO timeout
     cc.on_rto_timeout();
 
-    // After timeout, cwnd should be 1*MTU (RFC 4960 conservative restart)
+    // After timeout, cwnd should be 2*MTU (balanced restart)
     // ssthresh should be half of old cwnd (but min SSTHRESH_MIN)
     let (cwnd_after, ssthresh_after, flight_after) = cc.stats();
-    assert_eq!(cwnd_after, MTU, "cwnd should be 1*MTU after timeout");
+    assert_eq!(cwnd_after, MTU * 2, "cwnd should be 2*MTU after timeout");
     let expected_ssthresh = (CWND_INITIAL / 2).max(SSTHRESH_MIN);
     assert_eq!(
         ssthresh_after, expected_ssthresh,
@@ -115,7 +115,7 @@ fn test_congestion_control_rto_timeout() {
     );
     assert_eq!(flight_after, 0, "flight size should be reset to 0");
 
-    // Should be able to send 1 MTU now
+    // Should be able to send 2 MTUs now
     assert!(cc.can_send());
 }
 
@@ -164,7 +164,7 @@ fn test_congestion_control_rate_limiting_scenario() {
         "After RTO: cwnd={}, ssthresh={}, flight={}",
         cwnd_after_rto, ssthresh_after_rto, flight_after_rto
     );
-    assert_eq!(cwnd_after_rto, MTU, "cwnd should be 1*MTU");
+    assert_eq!(cwnd_after_rto, MTU * 2, "cwnd should be 2*MTU");
     assert_eq!(flight_after_rto, 0, "flight should be 0");
 
     // Scenario 3: Recovery - slowly increase sending rate
@@ -224,7 +224,7 @@ fn test_congestion_control_multiple_timeouts() {
             cwnd_after, ssthresh_after, flight_after
         );
 
-        assert_eq!(cwnd_after, MTU, "cwnd should be 1*MTU after timeout");
+        assert_eq!(cwnd_after, MTU * 2, "cwnd should be 2*MTU after timeout");
         assert_eq!(flight_after, 0, "flight should always reset to 0");
 
         // Key assertion: ssthresh should keep decreasing or hit minimum
@@ -283,8 +283,8 @@ fn test_congestion_control_cwnd_not_stuck() {
     cc.on_rto_timeout();
     let (cwnd1, ssthresh1, _) = cc.stats();
     println!("After 1st timeout: cwnd={}, ssthresh={}", cwnd1, ssthresh1);
-    // cwnd should be 1*MTU (RFC 4960 conservative restart)
-    assert_eq!(cwnd1, MTU, "cwnd should be 1*MTU after first timeout");
+    // cwnd should be 2*MTU
+    assert_eq!(cwnd1, MTU * 2, "cwnd should be 2*MTU after first timeout");
     let expected_ssthresh1 = (CWND_INITIAL / 2).max(SSTHRESH_MIN);
     assert_eq!(
         ssthresh1, expected_ssthresh1,
@@ -306,31 +306,31 @@ fn test_congestion_control_cwnd_not_stuck() {
     cc.on_rto_timeout();
     let (cwnd2, ssthresh2, _) = cc.stats();
     println!("After 2nd timeout: cwnd={}, ssthresh={}", cwnd2, ssthresh2);
-    assert_eq!(cwnd2, MTU, "cwnd should be 1*MTU");
+    assert_eq!(cwnd2, MTU * 2, "cwnd should be 2*MTU");
     // ssthresh should be half of cwnd_grown, but at least SSTHRESH_MIN
     let expected_ssthresh2 = (cwnd_grown / 2).max(SSTHRESH_MIN);
     assert_eq!(ssthresh2, expected_ssthresh2);
 
-    // Third timeout from cwnd=1*MTU=1200
+    // Third timeout from cwnd=2*MTU=2400
     cc.on_rto_timeout();
     let (cwnd3, ssthresh3, _) = cc.stats();
     println!("After 3rd timeout: cwnd={}, ssthresh={}", cwnd3, ssthresh3);
-    // cwnd should still be 1*MTU (at minimum)
-    assert_eq!(cwnd3, MTU, "cwnd should remain at 1*MTU minimum");
-    // ssthresh = max(1200/2, SSTHRESH_MIN) = max(600, 4000) = 4000
+    // cwnd should still be 2*MTU
+    assert_eq!(cwnd3, MTU * 2, "cwnd should remain at 2*MTU");
+    // ssthresh = max(2400/2, 4000) = max(1200, 4000) = 4000
     assert_eq!(
         ssthresh3, SSTHRESH_MIN,
         "ssthresh should be at SSTHRESH_MIN"
     );
 
-    // Fourth timeout - verify cwnd stays at minimum
+    // Fourth timeout - verify cwnd stays at 2*MTU
     cc.on_rto_timeout();
     let (cwnd4, ssthresh4, _) = cc.stats();
     println!("After 4th timeout: cwnd={}, ssthresh={}", cwnd4, ssthresh4);
-    assert_eq!(cwnd4, MTU, "cwnd should still be 1*MTU");
+    assert_eq!(cwnd4, MTU * 2, "cwnd should still be 2*MTU");
     assert_eq!(ssthresh4, SSTHRESH_MIN);
 
-    // Verify we can still send data
+    // Verify we can still send data (cwnd=2*MTU)
     assert!(
         cc.can_send(),
         "Should be able to send even after multiple timeouts"
@@ -388,9 +388,9 @@ fn test_flight_size_not_duplicated_on_rto() {
         flight_after_rto
     );
 
-    // Simulate retransmission of chunks (limited by cwnd=1*MTU now)
+    // Simulate retransmission of chunks (limited by cwnd=2*MTU now)
     let mut retrans_count = 0;
-    while cc.can_send() && retrans_count < 2 {
+    while cc.can_send() && retrans_count < 3 {
         cc.send(MTU);
         retrans_count += 1;
     }
@@ -406,8 +406,8 @@ fn test_flight_size_not_duplicated_on_rto() {
         "Flight size should only count retransmitted chunks, not original+retrans"
     );
     assert!(
-        retrans_count >= 1,
-        "Should have retransmitted at least 1 chunk (cwnd={})",
+        retrans_count >= 2,
+        "Should have retransmitted at least 2 chunks (cwnd=2*MTU={})",
         cwnd_after_retrans
     );
 
@@ -487,10 +487,10 @@ fn test_rto_overflow_chunks_drainable() {
     );
 
     // After RTO timeout:
-    // - cwnd should be 1*MTU (RFC 4960 conservative restart)
+    // - cwnd should be 2*MTU
     // - flight_size reset to 0 (test model simplification)
-    // - Should be able to send at least one MTU
-    assert_eq!(cwnd_after_rto, MTU, "cwnd should be 1*MTU after RTO");
+    // - Should be able to send 2 MTUs
+    assert_eq!(cwnd_after_rto, MTU * 2, "cwnd should be 2*MTU after RTO");
     assert_eq!(flight_after_rto, 0, "Flight should be reset after RTO");
     assert!(cc.can_send(), "Should be able to send after RTO");
 
@@ -503,11 +503,16 @@ fn test_rto_overflow_chunks_drainable() {
     );
     assert_eq!(flight_after_first_retrans, MTU, "Flight should be 1 MTU");
 
-    // After sending 1 MTU, flight equals cwnd, so can't send more yet
-    assert!(
-        !cc.can_send(),
-        "Window should be full after 1 MTU (cwnd=1*MTU)"
+    // Can send second chunk (cwnd=2*MTU)
+    assert!(cc.can_send(), "Should be able to send second chunk");
+    cc.send(MTU);
+    let flight_after_second = cc.flight_size.load(Ordering::SeqCst);
+    println!(
+        "After second retransmission: flight={}",
+        flight_after_second
     );
+    assert_eq!(flight_after_second, 2 * MTU, "Flight should be 2*MTU");
+    assert!(!cc.can_send(), "Window should be full after 2 MTU");
 
     // Simulate successful ACK to grow window again
     cc.on_ack(MTU);
@@ -522,7 +527,7 @@ fn test_rto_overflow_chunks_drainable() {
     assert!(cc.can_send(), "Should be able to send after ACK");
 
     // Send remaining chunks progressively
-    let mut total_retransmitted = MTU; // Already sent 1 MTU above
+    let mut total_retransmitted = 2 * MTU; // Already sent 2 MTU above
     while total_retransmitted < chunk_count * MTU && cc.can_send() {
         cc.send(MTU);
         cc.on_ack(MTU); // Simulate progressive ACKs to grow window

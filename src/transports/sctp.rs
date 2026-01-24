@@ -753,6 +753,7 @@ impl SctpInner {
     async fn handle_timeout(&self) -> Result<()> {
         let mut to_retransmit = Vec::new();
         let mut abandoned_tsn: Option<u32> = None;
+        let retransmit_size; // Track total size of retransmit batch
 
         // 1. Collect all expired chunks and backoff RTO once
         let now = Instant::now();
@@ -806,6 +807,7 @@ impl SctpInner {
 
             let mut current_len: usize = 0;
             let max_packet_payload = MAX_SCTP_PACKET_SIZE - SCTP_COMMON_HEADER_SIZE;
+            let mut retransmit_batch_size: usize = 0; // Track total size to add back to flight_size
 
             for (tsn, record) in sent_queue.iter_mut() {
                 if record.acked {
@@ -832,25 +834,22 @@ impl SctpInner {
                     {
                         to_retransmit.push((*tsn, record.payload.clone()));
                         current_len += record.payload.len();
+                        retransmit_batch_size += record.payload.len();
                         record.transmit_count += 1;
                         record.sent_time = now;
-                        // Mark as in_flight for immediate retransmission
-                        if !record.in_flight {
-                            self.flight_size
-                                .fetch_add(record.payload.len(), Ordering::SeqCst);
-                        }
                         record.in_flight = true;
                     } else {
-                        // CRITICAL: Mark as NOT in_flight so drain_retransmissions can handle it
-                        // These chunks will be retransmitted by drain_retransmissions() as cwnd/rwnd allows
-                        if record.in_flight {
-                            self.flight_size
-                                .fetch_sub(record.payload.len(), Ordering::SeqCst);
-                            record.in_flight = false;
-                        }
+                        // These chunks will be retransmitted by drain_retransmissions()
+                        record.in_flight = false;
                     }
                 }
             }
+
+            // Save retransmit_size to outer scope
+            retransmit_size = retransmit_batch_size;
+
+            // Note: At this point all in_flight flags are false and flight_size is 0
+            // We will add retransmit_size back after setting cwnd
         }
 
         if let Some(tsn) = abandoned_tsn {
@@ -890,12 +889,14 @@ impl SctpInner {
                 }
             }
 
-            // Reduce ssthresh and cwnd (RFC 4960)
+            // Reduce ssthresh and cwnd (RFC 4960 with practical adjustment)
             let cwnd = self.cwnd.load(Ordering::SeqCst);
             let new_ssthresh = (cwnd / 2).max(SSTHRESH_MIN);
             self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
-            // RFC 4960: Set cwnd to 1*MTU after RTO timeout (most conservative restart)
-            let new_cwnd = MAX_SCTP_PACKET_SIZE;
+            // RFC 4960 suggests 1*MTU, but use 2*MTU for better recovery
+            // This allows sending 2 chunks per RTT, reducing the risk of stalling
+            // while still being conservative compared to the pre-timeout window
+            let new_cwnd = MAX_SCTP_PACKET_SIZE * 2;
             self.cwnd.store(new_cwnd, Ordering::SeqCst);
             self.partial_bytes_acked.store(0, Ordering::SeqCst);
             self.fast_recovery_active.store(false, Ordering::SeqCst);
@@ -905,6 +906,13 @@ impl SctpInner {
                 "Congestion Control: RTO timeout, cwnd {} -> {}, ssthresh {}",
                 cwnd, new_cwnd, new_ssthresh
             );
+
+            // CRITICAL: Add retransmit_size to flight_size AFTER setting cwnd
+            // This ensures flight_size reflects the actual in-flight data
+            if retransmit_size > 0 {
+                self.flight_size
+                    .fetch_add(retransmit_size, Ordering::SeqCst);
+            }
 
             // Retransmit expired chunks
             let chunks: Vec<Bytes> = to_retransmit.into_iter().map(|(_, p)| p).collect();
@@ -921,27 +929,35 @@ impl SctpInner {
     }
 
     async fn drain_retransmissions(&self) -> Result<()> {
-        let mut chunks_to_send = Vec::new();
         let now = Instant::now();
-        {
+        let chunks_to_send = {
             let mut sent_queue = self.sent_queue.lock().unwrap();
+            let current_flight = self.flight_size.load(Ordering::SeqCst);
             let cwnd = self.cwnd.load(Ordering::SeqCst);
             let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
             let effective_window = cwnd.min(rwnd);
 
-            for record in sent_queue.values_mut() {
-                let flight = self.flight_size.load(Ordering::SeqCst);
-                if flight >= effective_window {
-                    break;
-                }
+            if current_flight >= effective_window {
+                return Ok(()); // Window already full
+            }
 
+            let available_window = effective_window - current_flight;
+            let mut chunks_to_send = Vec::new();
+            let mut total_size = 0;
+
+            // Collect chunks that fit in available window
+            for record in sent_queue.values_mut() {
                 if !record.acked && !record.in_flight && !record.abandoned {
+                    let len = record.payload.len();
+                    if total_size + len > available_window {
+                        break; // Would exceed window
+                    }
+
                     record.in_flight = true;
                     record.transmit_count += 1;
                     record.sent_time = now;
                     record.fast_retransmit = false;
-                    let len = record.payload.len();
-                    self.flight_size.fetch_add(len, Ordering::SeqCst);
+                    total_size += len;
                     chunks_to_send.push(record.payload.clone());
 
                     if chunks_to_send.len() >= 32 {
@@ -949,7 +965,29 @@ impl SctpInner {
                     }
                 }
             }
-        }
+
+            // Atomically add total size to flight_size
+            if total_size > 0 {
+                let new_flight = current_flight + total_size;
+                if new_flight > effective_window {
+                    // Shouldn't happen with our logic, but guard against it
+                    warn!(
+                        "drain_retransmissions: would exceed window (flight={} + {} > {}), skipping",
+                        current_flight, total_size, effective_window
+                    );
+                    // Roll back in_flight flags
+                    for record in sent_queue.values_mut() {
+                        if record.in_flight && record.sent_time == now {
+                            record.in_flight = false;
+                        }
+                    }
+                    return Ok(());
+                }
+                self.flight_size.store(new_flight, Ordering::SeqCst);
+            }
+
+            chunks_to_send
+        };
 
         if !chunks_to_send.is_empty() {
             debug!(
@@ -2277,6 +2315,20 @@ impl SctpInner {
             {
                 let mut queue = self.sent_queue.lock().unwrap();
                 let was_empty = queue.is_empty();
+
+                // Check window before adding to flight_size
+                let chunk_len = chunk.len();
+                let current_flight = self.flight_size.load(Ordering::SeqCst);
+                let cwnd = self.cwnd.load(Ordering::SeqCst);
+                let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
+                let effective_window = cwnd.min(rwnd);
+
+                if current_flight + chunk_len > effective_window {
+                    // Window full, this shouldn't happen for empty packets but guard it
+                    warn!("Empty packet would exceed window, dropping");
+                    return Ok(());
+                }
+
                 let record = ChunkRecord {
                     payload: chunk.clone(),
                     sent_time: Instant::now(),
@@ -2289,7 +2341,8 @@ impl SctpInner {
                     acked: false,
                 };
                 queue.insert(tsn, record);
-                self.flight_size.fetch_add(chunk.len(), Ordering::SeqCst);
+                self.flight_size
+                    .store(current_flight + chunk_len, Ordering::SeqCst);
                 if was_empty {
                     self.timer_notify.notify_one();
                     let mut cached = self.cached_rto_timeout.lock().unwrap();
@@ -2390,37 +2443,65 @@ impl SctpInner {
                 }
             }
 
-            // 3. Batch insert into sent_queue
-            {
+            // 3. Batch insert into sent_queue with flow control protection
+            let chunks_to_send = {
                 let mut queue = self.sent_queue.lock().unwrap();
                 let now = Instant::now();
                 let was_empty = queue.is_empty();
 
-                for (tsn, chunk) in &chunks {
-                    let record = ChunkRecord {
-                        payload: chunk.clone(),
-                        sent_time: now,
-                        transmit_count: 0,
-                        missing_reports: 0,
-                        stream_id: channel_id,
-                        abandoned: false,
-                        fast_retransmit: false,
-                        in_flight: true,
-                        acked: false,
-                    };
-                    queue.insert(*tsn, record);
-                    self.flight_size.fetch_add(chunk.len(), Ordering::SeqCst);
-                }
+                // Calculate total batch size
+                let total_batch_size: usize = chunks.iter().map(|(_, c)| c.len()).sum();
 
-                if was_empty {
-                    self.timer_notify.notify_one();
-                    let mut cached = self.cached_rto_timeout.lock().unwrap();
-                    *cached = None;
+                // Atomically check and add to flight_size
+                let current_flight = self.flight_size.load(Ordering::SeqCst);
+                let cwnd = self.cwnd.load(Ordering::SeqCst);
+                let rwnd = self.peer_rwnd.load(Ordering::SeqCst) as usize;
+                let effective_window = cwnd.min(rwnd);
+
+                let new_flight = current_flight + total_batch_size;
+                if new_flight > effective_window {
+                    // Window closed due to race condition, don't send this batch
+                    // The outer loop will wait for flow_control_notify and retry
+                    warn!(
+                        "Flow control race detected: flight={} + batch={} > window={}, dropping batch",
+                        current_flight, total_batch_size, effective_window
+                    );
+                    vec![] // Return empty vector to skip transmission
+                } else {
+                    // Safe to add - do it atomically
+                    self.flight_size.store(new_flight, Ordering::SeqCst);
+
+                    for (tsn, chunk) in &chunks {
+                        let record = ChunkRecord {
+                            payload: chunk.clone(),
+                            sent_time: now,
+                            transmit_count: 0,
+                            missing_reports: 0,
+                            stream_id: channel_id,
+                            abandoned: false,
+                            fast_retransmit: false,
+                            in_flight: true,
+                            acked: false,
+                        };
+                        queue.insert(*tsn, record);
+                    }
+
+                    if was_empty {
+                        self.timer_notify.notify_one();
+                        let mut cached = self.cached_rto_timeout.lock().unwrap();
+                        *cached = None;
+                    }
+
+                    chunks.into_iter().map(|(_, c)| c).collect()
                 }
+            };
+
+            if !chunks_to_send.is_empty() {
+                self.transmit_chunks(chunks_to_send).await?;
+            } else {
+                // Race detected, don't advance offset, let outer loop retry
+                break;
             }
-
-            let chunks_to_send: Vec<Bytes> = chunks.into_iter().map(|(_, c)| c).collect();
-            self.transmit_chunks(chunks_to_send).await?;
         }
 
         Ok(())
