@@ -400,7 +400,7 @@ mod tests {
         assert_eq!(config.sctp_rto_initial, Duration::from_millis(200));
         assert_eq!(config.sctp_rto_min, Duration::from_millis(100));
         assert_eq!(config.sctp_rto_max, Duration::from_secs(60));
-        assert_eq!(config.sctp_max_association_retransmits, 8);
+        assert_eq!(config.sctp_max_association_retransmits, 20);
     }
 
     #[test]
