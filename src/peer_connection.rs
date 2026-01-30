@@ -145,6 +145,7 @@ impl NackStats for DefaultRtpSenderNackHandler {
 
 pub struct DefaultRtpReceiverNackHandler {
     last_seq: AtomicU16,
+    last_ssrc: AtomicU32,
     initialized: std::sync::atomic::AtomicBool,
     pub nack_sent_count: AtomicU64,
     pub nack_recovered_count: AtomicU64,
@@ -154,6 +155,7 @@ impl DefaultRtpReceiverNackHandler {
     pub fn new() -> Self {
         Self {
             last_seq: AtomicU16::new(0),
+            last_ssrc: AtomicU32::new(0),
             initialized: std::sync::atomic::AtomicBool::new(false),
             nack_sent_count: AtomicU64::new(0),
             nack_recovered_count: AtomicU64::new(0),
@@ -165,7 +167,22 @@ impl DefaultRtpReceiverNackHandler {
 impl RtpReceiverInterceptor for DefaultRtpReceiverNackHandler {
     async fn on_packet_received(&self, packet: &RtpPacket) -> Option<RtcpPacket> {
         let seq = packet.header.sequence_number;
+        let ssrc = packet.header.ssrc;
+
+        // Check if SSRC changed - indicates stream switch
+        let last_ssrc = self.last_ssrc.load(Ordering::SeqCst);
+        if last_ssrc != 0 && last_ssrc != ssrc {
+            debug!(
+                "NACK: SSRC changed from {} to {}, resetting state",
+                last_ssrc, ssrc
+            );
+            self.last_ssrc.store(ssrc, Ordering::SeqCst);
+            self.last_seq.store(seq, Ordering::SeqCst);
+            return None; // Don't send NACK on stream switch
+        }
+
         if !self.initialized.swap(true, Ordering::SeqCst) {
+            self.last_ssrc.store(ssrc, Ordering::SeqCst);
             self.last_seq.store(seq, Ordering::SeqCst);
             return None;
         }
@@ -1184,7 +1201,12 @@ impl PeerConnection {
         }
 
         let srtp_required = self.config().transport_mode != TransportMode::Rtp;
-        let rtp_transport = Arc::new(RtpTransport::new(ice_conn.clone(), srtp_required));
+        let allow_ssrc_change = self.config().enable_latching;
+        let rtp_transport = Arc::new(RtpTransport::new_with_ssrc_change(
+            ice_conn.clone(),
+            srtp_required,
+            allow_ssrc_change,
+        ));
         {
             let mut rx = ice_conn.rtp_receiver.write().unwrap();
             *rx = Some(Arc::downgrade(&rtp_transport)

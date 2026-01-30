@@ -29,6 +29,14 @@ impl JitterBuffer {
         }
     }
 
+    /// Reset the jitter buffer state, clearing all samples and statistics.
+    /// This should be called when a stream discontinuity is detected (e.g., SSRC change).
+    pub fn reset(&mut self) {
+        self.samples.clear();
+        self.last_delivered_seq = None;
+        self.last_delivered_timestamp = None;
+    }
+
     pub fn push(&mut self, sample: MediaSample) {
         let (seq_opt, timestamp) = match &sample {
             MediaSample::Audio(f) => (f.sequence_number, f.rtp_timestamp),
@@ -59,30 +67,40 @@ impl JitterBuffer {
 
             let ts_diff = timestamp.wrapping_sub(last_ts);
 
-            // Reject packets with timestamp jumps > max_reasonable_jump (forward or backward)
+            // Detect stream discontinuity and reset buffer instead of rejecting
             // Using wrapping math: if ts_diff > half of u32::MAX, it's a backward jump
             if ts_diff > max_reasonable_jump && ts_diff < (u32::MAX / 2) {
-                // Massive forward jump - likely from a different stream
-                tracing::debug!(
-                    "JitterBuffer: Rejecting packet with large timestamp jump: seq={} ts={} last_ts={} diff={} (>{}s)",
-                    seq,
-                    timestamp,
-                    last_ts,
-                    ts_diff,
+                // Massive forward jump - likely SSRC change or stream switch
+                tracing::info!(
+                    "JitterBuffer: Detected stream switch (timestamp jump {}s), resetting buffer",
                     ts_diff / 8000
+                );
+                self.reset();
+                // Accept this packet as the start of new stream
+                self.samples.insert(
+                    seq,
+                    BufferedSample {
+                        sample,
+                        arrival: Instant::now(),
+                    },
                 );
                 return;
             } else if ts_diff > (u32::MAX / 2) {
                 // Backward jump (wrapped subtraction)
                 let backward_diff = last_ts.wrapping_sub(timestamp);
                 if backward_diff > max_reasonable_jump {
-                    tracing::debug!(
-                        "JitterBuffer: Rejecting packet with large backward timestamp jump: seq={} ts={} last_ts={} backward_diff=-{} (>{}s)",
-                        seq,
-                        timestamp,
-                        last_ts,
-                        backward_diff,
+                    tracing::info!(
+                        "JitterBuffer: Detected backward stream switch (timestamp jump -{}s), resetting buffer",
                         backward_diff / 8000
+                    );
+                    self.reset();
+                    // Accept this packet as the start of new stream
+                    self.samples.insert(
+                        seq,
+                        BufferedSample {
+                            sample,
+                            arrival: Instant::now(),
+                        },
                     );
                     return;
                 }
@@ -228,6 +246,7 @@ mod tests {
             sequence_number: Some(seq),
             rtp_timestamp: seq as u32 * 160,
             payload_type: Some(0),
+            clock_rate: 8000, // Set proper clock rate
             data: Bytes::from(vec![0u8; 160]),
             ..Default::default()
         })
@@ -270,7 +289,8 @@ mod tests {
 
         jb.push(make_sample(3)); // Gap: 2 is missing
 
-        // Should not pop 3 immediately because we are waiting for 2
+        // Should not pop 3 immediately because we are waiting for 2 (need max_delay to pass)
+        std::thread::sleep(Duration::from_millis(10));
         assert!(jb.pop().is_none());
     }
 
@@ -338,5 +358,64 @@ mod tests {
             MediaSample::Audio(f) => f.sequence_number.unwrap(),
             MediaSample::Video(f) => f.sequence_number.unwrap(),
         }
+    }
+
+    #[test]
+    fn test_jitter_buffer_reset() {
+        let mut jb = JitterBuffer::new(Duration::from_millis(0), Duration::from_millis(100), 10);
+
+        jb.push(make_sample(1));
+        jb.push(make_sample(2));
+        assert!(!jb.is_empty());
+
+        jb.reset();
+        assert!(jb.is_empty());
+        assert!(jb.last_delivered_seq.is_none());
+        assert!(jb.last_delivered_timestamp.is_none());
+    }
+
+    #[test]
+    fn test_jitter_buffer_ssrc_change_forward_jump() {
+        let mut jb = JitterBuffer::new(Duration::from_millis(0), Duration::from_millis(100), 10);
+
+        // First stream
+        jb.push(make_sample(1));
+        assert_eq!(get_seq(jb.pop().unwrap()), 1);
+
+        // SSRC change causes massive timestamp jump (simulate 100 seconds)
+        let mut new_sample = make_sample(2);
+        if let MediaSample::Audio(ref mut f) = new_sample {
+            f.rtp_timestamp = 800000; // 100 seconds at 8kHz
+        }
+
+        jb.push(new_sample);
+
+        // Buffer should reset and accept new stream
+        assert_eq!(jb.samples.len(), 1);
+        let popped = jb.pop().unwrap();
+        assert_eq!(get_seq(popped), 2);
+    }
+
+    #[test]
+    fn test_jitter_buffer_ssrc_change_backward_jump() {
+        let mut jb = JitterBuffer::new(Duration::from_millis(0), Duration::from_millis(100), 10);
+
+        // First stream with high timestamp
+        let mut first_sample = make_sample(1);
+        if let MediaSample::Audio(ref mut f) = first_sample {
+            f.rtp_timestamp = 800000; // High timestamp
+        }
+        jb.push(first_sample);
+        assert_eq!(get_seq(jb.pop().unwrap()), 1);
+
+        // SSRC change causes backward timestamp jump (new stream starts from 0)
+        let new_sample = make_sample(2); // timestamp = 320 (2 * 160)
+
+        jb.push(new_sample);
+
+        // Buffer should reset and accept new stream
+        assert_eq!(jb.samples.len(), 1);
+        let popped = jb.pop().unwrap();
+        assert_eq!(get_seq(popped), 2);
     }
 }
