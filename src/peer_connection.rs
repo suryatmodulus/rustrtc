@@ -25,8 +25,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{broadcast, mpsc, watch};
-use tracing::{debug, trace, warn};
-// use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -1411,7 +1410,7 @@ impl PeerConnection {
                      return Err(RtcError::Internal("SCTP runner stopped unexpectedly".into()));
                 }
                 _ = &mut dc_listener => {
-                     warn!("DataChannel listener stopped unexpectedly");
+                     debug!("DataChannel listener stopped unexpectedly");
                      return Err(RtcError::Internal("DataChannel listener stopped unexpectedly".into()));
                 }
                 res = state_rx.changed() => {
@@ -1591,11 +1590,11 @@ impl PeerConnection {
                     *self.inner.rtp_transport.lock().unwrap() = Some(rtp_transport.clone());
                 }
                 Err(e) => {
-                    warn!("Failed to create SRTP session: {}", e);
+                    debug!("Failed to create SRTP session: {}", e);
                 }
             }
         } else {
-            warn!(
+            debug!(
                 "Failed to export keying material - DTLS state: {}",
                 dtls.get_state()
             );
@@ -1813,7 +1812,7 @@ impl PeerConnection {
                 let dc_clone = dc.clone();
                 tokio::spawn(async move {
                     if let Err(e) = transport.send_dcep_open(&dc_clone).await {
-                        warn!("Failed to send DCEP OPEN: {}", e);
+                        debug!("Failed to send DCEP OPEN: {}", e);
                     }
                 });
             }
@@ -1902,7 +1901,7 @@ impl PeerConnection {
                         let old_ssrc = receiver.ssrc();
                         if old_ssrc != new_ssrc {
                             if old_ssrc != 0 {
-                                warn!(
+                                debug!(
                                     "SSRC changed for mid={} ({} -> {}), updating listener",
                                     section.mid, old_ssrc, new_ssrc
                                 );
@@ -2258,7 +2257,7 @@ async fn handle_connected_state_no_dtls(
         // For RTP/SRTP, we pass false as is_client, but it doesn't matter as start_dtls handles it
         match pc_temp.start_dtls(false).await {
             Err(e) => {
-                warn!("Transport start failed: {}", e);
+                debug!("Transport start failed: {}", e);
                 let _ = inner.peer_state.send(PeerConnectionState::Failed);
                 return false;
             }
@@ -2300,7 +2299,7 @@ async fn handle_connected_state(
 
                 match pc_temp.start_dtls(is_client).await {
                     Err(e) => {
-                        warn!("DTLS start failed: {}", e);
+                        debug!("DTLS start failed: {}", e);
                         let _ = inner.peer_state.send(PeerConnectionState::Failed);
                         return false;
                     }
@@ -3979,7 +3978,7 @@ impl RtpReceiver {
                                                         let transport = this.transport.lock().unwrap().clone();
                                                         if let Some(transport) = transport {
                                                             if let Err(e) = transport.send_rtcp(&[packet]).await {
-                                                                warn!("Failed to send PLI: {}", e);
+                                                                debug!("Failed to send PLI: {}", e);
                                                             }
                                                         }
                                                     }

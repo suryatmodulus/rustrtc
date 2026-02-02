@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, instrument, trace};
 
 #[cfg(any(test, feature = "simulator"))]
 use self::stun::random_u32;
@@ -180,7 +180,7 @@ impl IceTransportRunner {
                             let inner = self.inner.clone();
                             gathering_future = Box::pin(async move {
                                 if let Err(e) = inner.gatherer.gather().await {
-                                    warn!("Gathering failed: {}", e);
+                                    debug!("Gathering failed: {}", e);
                                 }
                                 {
                                     let mut buffer = inner.local_candidates.lock().await;
@@ -467,7 +467,7 @@ impl IceTransport {
             *params = Some(remote);
         }
         if let Err(e) = self.inner.state.send(IceTransportState::Checking) {
-            warn!("start: failed to set state to Checking: {}", e);
+            debug!("start: failed to set state to Checking: {}", e);
         }
         self.try_connectivity_checks();
         Ok(())
@@ -790,7 +790,7 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
                     )
                     .await
                     {
-                        warn!("Failed to send nomination: {}", e);
+                        debug!("Failed to send nomination: {}", e);
                     }
                 });
             }
@@ -818,7 +818,7 @@ fn resolve_socket(inner: &IceTransportInner, pair: &IceCandidatePair) -> Option<
     } else {
         let socket = inner.gatherer.get_socket(pair.local.base_address());
         if socket.is_none() {
-            warn!(
+            debug!(
                 "resolve_socket: failed to find socket for {}",
                 pair.local.base_address()
             );
@@ -890,14 +890,14 @@ async fn handle_packet(
                     }
                 } else if msg.class == StunClass::ErrorResponse {
                     trace!("Received STUN Error Response from {}", addr);
-                    warn!(
+                    debug!(
                         "Received STUN Error Response from {}: {:?}",
                         addr, msg.error_code
                     );
                     if let Some(code) = msg.error_code {
                         if code == 401 {
                             let remote_params = inner.remote_parameters.lock().unwrap().clone();
-                            warn!(
+                            debug!(
                                 "STUN 401 received. Current remote params: {:?}",
                                 remote_params
                             );
@@ -920,7 +920,7 @@ async fn handle_packet(
             if buffer.len() < 100 {
                 buffer.push((packet.to_vec(), addr));
             } else {
-                warn!("Buffer full, dropping packet from {}", addr);
+                debug!("Buffer full, dropping packet from {}", addr);
             }
         }
     }
@@ -951,17 +951,17 @@ async fn handle_stun_request(
                             {
                                 debug!("Failed to send STUN Response to {}: {}", addr, e);
                             } else {
-                                warn!("Failed to send STUN Response to {}: {}", addr, e);
+                                debug!("Failed to send STUN Response to {}: {}", addr, e);
                             }
                         }
                     }
                 } else {
-                    warn!("Failed to send STUN Response to {}: {}", addr, e);
+                    debug!("Failed to send STUN Response to {}: {}", addr, e);
                 }
             }
         }
     } else {
-        warn!("Failed to encode STUN Response");
+        debug!("Failed to encode STUN Response");
     }
 
     // Check if we know this candidate
@@ -1029,7 +1029,7 @@ async fn handle_stun_request(
                 }
                 let _ = inner.state.send(IceTransportState::Connected);
             } else {
-                warn!(
+                debug!(
                     "Received UseCandidate but could not find pair for {} -> {}",
                     local_addr, addr
                 );
@@ -1128,7 +1128,7 @@ async fn perform_binding_check(
 
         trace!("Sending CreatePermission to TURN server");
         if let Err(e) = client.send(&perm_bytes).await {
-            warn!("CreatePermission send failed: {}", e);
+            debug!("CreatePermission send failed: {}", e);
             return Err(e);
         }
 
@@ -1220,7 +1220,7 @@ async fn perform_binding_check(
                         if e.raw_os_error() == Some(65) || e.raw_os_error() == Some(49) {
                             debug!("socket.send_to {} failed: {}", remote.address, e);
                         } else {
-                            warn!("socket.send_to {} failed: {}", remote.address, e);
+                            debug!("socket.send_to {} failed: {}", remote.address, e);
                         }
                     }
                 }
@@ -1541,7 +1541,7 @@ impl IceTransportBuilder {
         let (transport, runner) = IceTransport::new(config);
         transport.set_role(self.role);
         if let Err(err) = transport.start_gathering() {
-            warn!("ICE gather failed: {}", err);
+            debug!("ICE gather failed: {}", err);
         }
         (transport, runner)
     }
@@ -1640,14 +1640,14 @@ impl IceGatherer {
         let host_fut = async {
             if self.config.ice_transport_policy == IceTransportPolicy::All {
                 if let Err(e) = self.gather_host_candidates().await {
-                    warn!("Host gathering failed: {}", e);
+                    debug!("Host gathering failed: {}", e);
                 }
             }
         };
 
         let server_fut = async {
             if let Err(e) = self.gather_servers().await {
-                warn!("Server gathering failed: {}", e);
+                debug!("Server gathering failed: {}", e);
             }
         };
 
@@ -1728,9 +1728,9 @@ impl IceGatherer {
                 }
                 Err(e) => {
                     if self.config.bind_ip.is_some() {
-                        warn!("Failed to bind to requested bind_ip {}: {}", ip, e);
+                        debug!("Failed to bind to requested bind_ip {}: {}", ip, e);
                     } else if !ip.is_loopback() && !ip.is_unspecified() {
-                        warn!("Failed to bind socket on {}: {}", ip, e);
+                        debug!("Failed to bind socket on {}: {}", ip, e);
                     }
                 }
             }
@@ -1752,7 +1752,7 @@ impl IceGatherer {
                     let uri = match IceServerUri::parse(&url) {
                         Ok(uri) => uri,
                         Err(err) => {
-                            warn!("invalid ICE server URI {}: {}", url, err);
+                            debug!("invalid ICE server URI {}: {}", url, err);
                             return;
                         }
                     };
@@ -1763,14 +1763,14 @@ impl IceGatherer {
                                 match this.probe_stun(&uri).await {
                                     Ok(Some(candidate)) => this.push_candidate(candidate),
                                     Ok(None) => {}
-                                    Err(e) => warn!("STUN probe failed for {}: {}", url, e),
+                                    Err(e) => debug!("STUN probe failed for {}: {}", url, e),
                                 }
                             }
                         }
                         IceUriKind::Turn => match this.probe_turn(&uri, &server).await {
                             Ok(Some(candidate)) => this.push_candidate(candidate),
                             Ok(None) => {}
-                            Err(e) => warn!("TURN probe failed for {}: {}", url, e),
+                            Err(e) => debug!("TURN probe failed for {}: {}", url, e),
                         },
                     }
                 });
