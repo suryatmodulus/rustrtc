@@ -1,3 +1,4 @@
+pub mod depacketizer;
 pub mod error;
 pub mod frame;
 pub mod jitter_buffer;
@@ -5,6 +6,7 @@ pub mod packetizer;
 pub mod pipeline;
 pub mod track;
 
+pub use depacketizer::{Depacketizer, H264Depacketizer, PassThroughDepacketizer};
 pub use error::{MediaError, MediaResult};
 pub use frame::{AudioFrame, MediaKind, MediaSample, VideoFrame, VideoPixelFormat};
 pub use jitter_buffer::JitterBuffer;

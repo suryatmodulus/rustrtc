@@ -1,4 +1,7 @@
 use serde::{Deserialize, Serialize};
+use crate::media::depacketizer::{DefaultDepacketizerFactory, DepacketizerFactory};
+use std::sync::Arc;
+use std::fmt::{Debug, Formatter};
 
 /// Describes how credentials are conveyed for a given ICE server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -226,6 +229,34 @@ impl Default for MediaCapabilities {
     }
 }
 
+
+#[derive(Clone)]
+pub struct DepacketizerStrategy {
+    pub factory: Arc<dyn DepacketizerFactory>,
+}
+
+impl Default for DepacketizerStrategy {
+    fn default() -> Self {
+        Self {
+            factory: Arc::new(DefaultDepacketizerFactory),
+        }
+    }
+}
+
+impl Debug for DepacketizerStrategy {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.factory.fmt(f)
+    }
+}
+
+impl PartialEq for DepacketizerStrategy {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.factory, &other.factory)
+    }
+}
+
+impl Eq for DepacketizerStrategy {}
+
 /// Primary configuration for a `PeerConnection`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RtcConfiguration {
@@ -252,6 +283,8 @@ pub struct RtcConfiguration {
     pub rtp_start_port: Option<u16>,
     pub rtp_end_port: Option<u16>,
     pub enable_latching: bool,
+    #[serde(skip, default)]
+    pub depacketizer_strategy: DepacketizerStrategy,
 }
 
 impl Default for RtcConfiguration {
@@ -280,6 +313,7 @@ impl Default for RtcConfiguration {
             rtp_start_port: None,
             rtp_end_port: None,
             enable_latching: false,
+            depacketizer_strategy: DepacketizerStrategy::default(),
         }
     }
 }

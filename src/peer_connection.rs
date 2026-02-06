@@ -1,3 +1,4 @@
+use crate::media::depacketizer::{Depacketizer, DepacketizerFactory};
 use crate::media::track::{MediaStreamTrack, SampleStreamSource, SampleStreamTrack, sample_track};
 use crate::rtp::{
     FirRequest, FullIntraRequest, GenericNack, PictureLossIndication, RtcpPacket, RtpPacket,
@@ -252,6 +253,7 @@ enum LoopEvent {
         Option<(crate::rtp::RtpPacket, std::net::SocketAddr)>,
         Option<String>,
         mpsc::Receiver<(crate::rtp::RtpPacket, std::net::SocketAddr)>,
+        Box<dyn Depacketizer>,
     ),
     Feedback(Option<crate::media::track::FeedbackEvent>, Option<String>),
 }
@@ -424,8 +426,9 @@ impl PeerConnection {
             .map(|list| list.len())
             .unwrap_or(0);
         let ssrc = 2000 + index as u32;
-        let mut builder =
-            RtpReceiverBuilder::new(kind, ssrc).interceptor(self.inner.stats_collector.clone());
+        let mut builder = RtpReceiverBuilder::new(kind, ssrc)
+            .interceptor(self.inner.stats_collector.clone())
+            .depacketizer_factory(self.inner.config.depacketizer_strategy.factory.clone());
 
         let nack_enabled = if let Some(caps) = &self.inner.config.media_capabilities {
             match kind {
@@ -3542,12 +3545,14 @@ pub struct RtpReceiver {
     track_ready_event_tx: Mutex<Option<mpsc::UnboundedSender<PeerConnectionEvent>>>,
     track_ready_transceiver: Mutex<Option<Weak<RtpTransceiver>>>,
     track_event_sent: AtomicBool,
+    pub depacketizer_factory: Arc<dyn DepacketizerFactory>,
 }
 
 pub struct RtpReceiverBuilder {
     kind: MediaKind,
     ssrc: u32,
     interceptors: Vec<Arc<dyn RtpReceiverInterceptor>>,
+    depacketizer_factory: Option<Arc<dyn DepacketizerFactory>>,
 }
 
 impl RtpReceiverBuilder {
@@ -3556,7 +3561,13 @@ impl RtpReceiverBuilder {
             kind,
             ssrc,
             interceptors: Vec::new(),
+            depacketizer_factory: None,
         }
+    }
+
+    pub fn depacketizer_factory(mut self, factory: Arc<dyn DepacketizerFactory>) -> Self {
+        self.depacketizer_factory = Some(factory);
+        self
     }
 
     pub fn nack(mut self) -> Self {
@@ -3609,6 +3620,9 @@ impl RtpReceiverBuilder {
             track_ready_event_tx: Mutex::new(None),
             track_ready_transceiver: Mutex::new(None),
             track_event_sent: AtomicBool::new(false),
+            depacketizer_factory: self.depacketizer_factory.unwrap_or_else(|| {
+                Arc::new(crate::media::depacketizer::DefaultDepacketizerFactory)
+            }),
         })
     }
 }
@@ -3657,6 +3671,7 @@ impl RtpReceiver {
             track_ready_event_tx: Mutex::new(None),
             track_ready_transceiver: Mutex::new(None),
             track_event_sent: AtomicBool::new(false),
+            depacketizer_factory: Arc::new(crate::media::depacketizer::DefaultDepacketizerFactory),
         }
     }
 
@@ -3820,6 +3835,12 @@ impl RtpReceiver {
         mut cmd_rx: mpsc::UnboundedReceiver<ReceiverCommand>,
         initial_tracks: Vec<ReceiverCommand>,
     ) {
+        let depacketizer_factory = if let Some(receiver) = weak_self.upgrade() {
+            receiver.depacketizer_factory.clone()
+        } else {
+            Arc::new(crate::media::depacketizer::DefaultDepacketizerFactory)
+        };
+
         let mut futures = FuturesUnordered::new();
         let mut tracks = HashMap::new();
 
@@ -3834,6 +3855,7 @@ impl RtpReceiver {
                     Arc<tokio::sync::Mutex<mpsc::Receiver<crate::media::track::FeedbackEvent>>>,
                 ),
             >,
+            depacketizer_factory: &Arc<dyn DepacketizerFactory>,
         ) {
             let ReceiverCommand::AddTrack {
                 rid,
@@ -3843,13 +3865,19 @@ impl RtpReceiver {
                 simulcast_ssrc,
             } = cmd;
 
-            tracks.insert(rid.clone(), (source, simulcast_ssrc, feedback_rx.clone()));
+            tracks.insert(
+                rid.clone(),
+                (source.clone(), simulcast_ssrc, feedback_rx.clone()),
+            );
 
             let rid_clone = rid.clone();
+            // Initialize depacketizer
+            let depacketizer = depacketizer_factory.create(source.kind());
+
             futures.push(Box::pin(async move {
                 let mut rx = packet_rx;
                 let packet = rx.recv().await;
-                LoopEvent::Packet(packet, rid_clone, rx)
+                LoopEvent::Packet(packet, rid_clone, rx, depacketizer)
             }));
 
             let rid_clone = rid.clone();
@@ -3863,21 +3891,21 @@ impl RtpReceiver {
         }
 
         for cmd in initial_tracks {
-            handle_add_track(cmd, &mut futures, &mut tracks);
+            handle_add_track(cmd, &mut futures, &mut tracks, &depacketizer_factory);
         }
 
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(cmd) => handle_add_track(cmd, &mut futures, &mut tracks),
+                        Some(cmd) => handle_add_track(cmd, &mut futures, &mut tracks, &depacketizer_factory),
                         None => break,
                     }
                 }
                 event = futures.next(), if !futures.is_empty() => {
                     if let Some(event) = event {
                         match event {
-                            LoopEvent::Packet(packet_opt, rid, packet_rx) => {
+                            LoopEvent::Packet(packet_opt, rid, packet_rx, mut depacketizer) => {
                                 if let Some((packet, addr)) = packet_opt {
                                     if let Some((source, simulcast_ssrc, _)) = tracks.get(&rid) {
                                         if rid.is_some() {
@@ -3935,20 +3963,23 @@ impl RtpReceiver {
                                             }
 
                                             let params = this.params.lock().unwrap().clone();
-                                            let sample = crate::media::frame::MediaSample::from_rtp_packet(
-                                                packet,
-                                                source.kind(),
-                                                params.clock_rate,
-                                                addr,
-                                            );
-                                            if let Ok(_) = source.send(sample).await {
-                                                let rid_clone = rid.clone();
-                                                futures.push(Box::pin(async move {
-                                                    let mut rx = packet_rx;
-                                                    let packet = rx.recv().await;
-                                                    LoopEvent::Packet(packet, rid_clone, rx)
-                                                }));
+                                            let clock_rate = params.clock_rate;
+
+                                            // Fix: Use Depacketizer to handle frames correctly
+                                            if let Ok(samples) = depacketizer.push(packet.clone(), clock_rate, addr, source.kind()) {
+                                                for sample in samples {
+                                                    if let Err(e) = source.send(sample).await {
+                                                         tracing::warn!("Failed to send media sample: {}", e);
+                                                    }
+                                                }
                                             }
+
+                                            let rid_clone = rid.clone();
+                                            futures.push(Box::pin(async move {
+                                                let mut rx = packet_rx;
+                                                let packet = rx.recv().await;
+                                                LoopEvent::Packet(packet, rid_clone, rx, depacketizer)
+                                            }));
                                         } else {
                                             break;
                                         }
@@ -4713,5 +4744,41 @@ a=mid:0
         );
         println!("✓ When real RTP packets arrive with actual SSRC, Track event will be sent");
         println!("✓ Track event sending logic is in place at SSRC latching point");
+    }
+
+    #[tokio::test]
+    async fn test_custom_depacketizer_strategy() {
+        use crate::config::DepacketizerStrategy;
+        use crate::media::depacketizer::{
+            Depacketizer, DepacketizerFactory, PassThroughDepacketizer,
+        };
+        use crate::media::frame::MediaKind as FrameMediaKind;
+
+        #[derive(Debug)]
+        struct MockFactory;
+
+        impl DepacketizerFactory for MockFactory {
+            fn create(&self, _kind: FrameMediaKind) -> Box<dyn Depacketizer> {
+                Box::new(PassThroughDepacketizer)
+            }
+        }
+
+        let factory: Arc<dyn DepacketizerFactory> = Arc::new(MockFactory);
+        let mut config = RtcConfiguration::default();
+        config.depacketizer_strategy = DepacketizerStrategy {
+            factory: factory.clone(),
+        };
+
+        let pc = PeerConnection::new(config);
+
+        let retrieved_config = pc.config();
+        assert!(Arc::ptr_eq(
+            &retrieved_config.depacketizer_strategy.factory,
+            &factory
+        ));
+
+        // Ensure adding transceiver works with custom strategy
+        let transceiver = pc.add_transceiver(MediaKind::Video, TransceiverDirection::RecvOnly);
+        assert_eq!(transceiver.kind(), MediaKind::Video);
     }
 }
