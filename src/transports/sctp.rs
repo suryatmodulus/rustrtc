@@ -29,6 +29,10 @@ const SSTHRESH_MIN: usize = MAX_SCTP_PACKET_SIZE * 4; // 4 * 1200 = 4800 bytes
 const CWND_MIN_AFTER_RTO: usize = MAX_SCTP_PACKET_SIZE; // 1 * 1200 = 1200 bytes
 const MAX_BUFFERED_AMOUNT: usize = 4 * 1024 * 1024; // 4 MB
 
+// Fast Recovery re-entry cooldown: prevent rapid exit-then-re-enter cycles that
+// keep cwnd pinned at SSTHRESH_MIN on lossy links (e.g. rate-limited TURN relays).
+const FAST_RECOVERY_REENTRY_COOLDOWN: Duration = Duration::from_millis(200);
+
 #[derive(Debug, Clone)]
 pub(crate) struct ChunkRecord {
     payload: Bytes,
@@ -176,6 +180,7 @@ struct SctpInner {
     fast_recovery_exit_tsn: AtomicU32,
     fast_recovery_active: AtomicBool,
     fast_recovery_transmit: AtomicBool,
+    last_fast_recovery_entry: Mutex<Instant>,
 
     // Association Retransmission Limit
     max_association_retransmits: u32,
@@ -560,6 +565,7 @@ impl SctpTransport {
             fast_recovery_exit_tsn: AtomicU32::new(0),
             fast_recovery_active: AtomicBool::new(false),
             fast_recovery_transmit: AtomicBool::new(false),
+            last_fast_recovery_entry: Mutex::new(Instant::now() - Duration::from_secs(10)),
             max_association_retransmits: config.sctp_max_association_retransmits,
             association_error_count: AtomicU32::new(0),
             heartbeat_sent_time: Mutex::new(None),
@@ -1483,34 +1489,67 @@ impl SctpInner {
                     was_in_fast_recovery && (cumulative_tsn_ack.wrapping_sub(exit_tsn) as i32) < 0;
 
                 if !in_fast_recovery {
-                    // Enter Fast Recovery - update both TX and RX congestion windows
-                    let cwnd_tx = self.cwnd_tx.load(Ordering::SeqCst);
-                    let cwnd_rx = self.cwnd_rx.load(Ordering::SeqCst);
-                    let new_ssthresh_tx = (cwnd_tx / 2).max(SSTHRESH_MIN);
-                    let new_ssthresh_rx = (cwnd_rx / 2).max(SSTHRESH_MIN);
-                    let new_ssthresh = new_ssthresh_tx.min(new_ssthresh_rx); // Use minimum for shared ssthresh
-                    self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
-                    self.cwnd_tx.store(new_ssthresh, Ordering::SeqCst);
-                    self.cwnd_rx.store(new_ssthresh, Ordering::SeqCst);
-                    self.partial_bytes_acked.store(0, Ordering::SeqCst);
-                    self.fast_recovery_active.store(true, Ordering::SeqCst);
-                    self.fast_recovery_transmit.store(true, Ordering::SeqCst); // Trigger burst for retransmit
+                    let now_fr = Instant::now();
+                    let last_entry = *self.last_fast_recovery_entry.lock().unwrap();
+                    let since_last = now_fr.duration_since(last_entry);
 
-                    // Record the highest TSN currently in flight
-                    let highest_tsn = self.next_tsn.load(Ordering::SeqCst).wrapping_sub(1);
-                    self.fast_recovery_exit_tsn
-                        .store(highest_tsn, Ordering::SeqCst);
+                    // Cooldown: if we just exited Fast Recovery very recently, don't
+                    // re-enter immediately.  Instead just retransmit without cutting
+                    // the window again.  This prevents the cwnd-pinned-at-floor
+                    // oscillation seen on rate-limited TURN relays.
+                    if since_last < FAST_RECOVERY_REENTRY_COOLDOWN {
+                        debug!(
+                            "Fast Recovery re-entry suppressed ({}ms < {}ms cooldown), retransmitting {} chunks without cwnd cut",
+                            since_last.as_millis(),
+                            FAST_RECOVERY_REENTRY_COOLDOWN.as_millis(),
+                            outcome.retransmit.len()
+                        );
+                    } else {
+                        // Enter Fast Recovery - update both TX and RX congestion windows
+                        let cwnd_tx = self.cwnd_tx.load(Ordering::SeqCst);
+                        let cwnd_rx = self.cwnd_rx.load(Ordering::SeqCst);
 
-                    debug!(
-                        "Entering Fast Recovery! cwnd_tx {} -> {}, cwnd_rx {} -> {}, ssthresh: {}, exit_tsn: {}, retransmitting {} chunks",
-                        cwnd_tx,
-                        new_ssthresh,
-                        cwnd_rx,
-                        new_ssthresh,
-                        new_ssthresh,
-                        highest_tsn,
-                        outcome.retransmit.len()
-                    );
+                        // Use less aggressive β=0.7 when cwnd is already near the floor
+                        // (within 2x SSTHRESH_MIN).  Standard β=0.5 causes cwnd to always
+                        // clamp to SSTHRESH_MIN, creating a throughput ceiling on lossy links.
+                        let near_floor = cwnd_tx <= SSTHRESH_MIN * 2;
+                        let new_ssthresh_tx = if near_floor {
+                            (cwnd_tx * 7 / 10).max(SSTHRESH_MIN)
+                        } else {
+                            (cwnd_tx / 2).max(SSTHRESH_MIN)
+                        };
+                        let new_ssthresh_rx = if near_floor {
+                            (cwnd_rx * 7 / 10).max(SSTHRESH_MIN)
+                        } else {
+                            (cwnd_rx / 2).max(SSTHRESH_MIN)
+                        };
+                        let new_ssthresh = new_ssthresh_tx.min(new_ssthresh_rx);
+                        self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
+                        self.cwnd_tx.store(new_ssthresh, Ordering::SeqCst);
+                        self.cwnd_rx.store(new_ssthresh, Ordering::SeqCst);
+                        self.partial_bytes_acked.store(0, Ordering::SeqCst);
+                        self.fast_recovery_active.store(true, Ordering::SeqCst);
+                        self.fast_recovery_transmit.store(true, Ordering::SeqCst);
+
+                        // Record the highest TSN currently in flight
+                        let highest_tsn = self.next_tsn.load(Ordering::SeqCst).wrapping_sub(1);
+                        self.fast_recovery_exit_tsn
+                            .store(highest_tsn, Ordering::SeqCst);
+
+                        *self.last_fast_recovery_entry.lock().unwrap() = now_fr;
+
+                        debug!(
+                            "Entering Fast Recovery! cwnd_tx {} -> {}, cwnd_rx {} -> {}, ssthresh: {}, exit_tsn: {}, retransmitting {} chunks{}",
+                            cwnd_tx,
+                            new_ssthresh,
+                            cwnd_rx,
+                            new_ssthresh,
+                            new_ssthresh,
+                            highest_tsn,
+                            outcome.retransmit.len(),
+                            if near_floor { " (gentle β=0.7)" } else { "" }
+                        );
+                    }
                 }
             }
 
