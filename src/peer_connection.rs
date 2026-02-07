@@ -2917,6 +2917,11 @@ impl PeerConnectionInner {
             }
         }
 
+        // Close SCTP transport before closing DTLS/ICE to stop retransmission timers
+        if let Some(sctp) = self.sctp_transport.lock().unwrap().take() {
+            sctp.close();
+        }
+
         if let Some(dtls) = self.dtls_transport.lock().unwrap().as_ref() {
             dtls.close();
         }

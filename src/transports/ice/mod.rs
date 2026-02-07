@@ -681,6 +681,12 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     if state != IceTransportState::Checking {
         return;
     }
+
+    // If we already have a selected pair, don't run more checks
+    if inner.selected_pair.lock().unwrap().is_some() {
+        return;
+    }
+
     let locals = inner.gatherer.local_candidates();
     let remotes = inner.remote_candidates.lock().unwrap().clone();
     let role = *inner.role.lock().unwrap();
@@ -761,6 +767,18 @@ async fn perform_connectivity_checks_async(inner: Arc<IceTransportInner>) {
     let mut success = false;
     while let Some(res) = checks.next().await {
         if let Some(pair) = res {
+            // Check if another concurrent check already selected a pair
+            {
+                let existing = inner.selected_pair.lock().unwrap();
+                if existing.is_some() {
+                    debug!(
+                        "ICE: Ignoring pair {} -> {} (already have selected pair)",
+                        pair.local.address, pair.remote.address
+                    );
+                    success = true;
+                    break;
+                }
+            }
             *inner.selected_pair.lock().unwrap() = Some(pair.clone());
             let _ = inner.selected_pair_notifier.send(Some(pair.clone()));
             if let Some(socket) = resolve_socket(&inner, &pair) {
