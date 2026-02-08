@@ -4,12 +4,16 @@ use crate::transports::dtls::{DtlsState, DtlsTransport};
 use crate::transports::ice::stun::random_u32;
 use anyhow::Result;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::collections::{BTreeMap, VecDeque};
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, trace};
+
+type HmacSha1 = Hmac<Sha1>;
 
 // RTO Constants (RFC 4960)
 const RTO_ALPHA: f64 = 0.125;
@@ -27,11 +31,18 @@ const DUP_THRESH: u8 = 3;
 const CWND_INITIAL: usize = MAX_SCTP_PACKET_SIZE * 10; // 10 * 1200 = 12000 bytes
 const SSTHRESH_MIN: usize = MAX_SCTP_PACKET_SIZE * 4; // 4 * 1200 = 4800 bytes
 const CWND_MIN_AFTER_RTO: usize = MAX_SCTP_PACKET_SIZE; // 1 * 1200 = 1200 bytes
-const MAX_BUFFERED_AMOUNT: usize = 4 * 1024 * 1024; // 4 MB
+const MAX_CWND: usize = 256 * 1024; // 256 KB - cap cwnd to prevent unbounded memory growth
+const MAX_BUFFERED_AMOUNT: usize = 1024 * 1024; // 1 MB
 
 // Fast Recovery re-entry cooldown: prevent rapid exit-then-re-enter cycles that
 // keep cwnd pinned at SSTHRESH_MIN on lossy links (e.g. rate-limited TURN relays).
 const FAST_RECOVERY_REENTRY_COOLDOWN: Duration = Duration::from_millis(200);
+
+const SCTP_MAX_INIT_RETRANS: u32 = 8;
+const COOKIE_HMAC_LEN: usize = 20; // SHA1 output
+const COOKIE_TIMESTAMP_LEN: usize = 8; // u64 millis
+const COOKIE_TOTAL_LEN: usize = COOKIE_TIMESTAMP_LEN + COOKIE_HMAC_LEN;
+const COOKIE_LIFETIME_MS: u64 = 60_000;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ChunkRecord {
@@ -45,6 +56,66 @@ pub(crate) struct ChunkRecord {
     fast_retransmit_time: Option<Instant>,
     in_flight: bool,
     acked: bool,
+    // PR-SCTP fields
+    stream_id: u16,
+    ssn: u16,
+    #[allow(dead_code)]
+    flags: u8,
+    max_retransmits: Option<u16>,
+    expiry: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct InboundStream {
+    next_ssn: u16,
+    pending: BTreeMap<u16, Bytes>,
+}
+
+impl InboundStream {
+    fn new() -> Self {
+        Self {
+            next_ssn: 0,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    fn enqueue(&mut self, ssn: u16, msg: Bytes) -> Vec<Bytes> {
+        self.pending.insert(ssn, msg);
+        self.drain_ready()
+    }
+
+    fn drain_ready(&mut self) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        while let Some(msg) = self.pending.remove(&self.next_ssn) {
+            out.push(msg);
+            self.next_ssn = self.next_ssn.wrapping_add(1);
+        }
+        out
+    }
+
+    fn advance_ssn_to(&mut self, ssn: u16) {
+        if ssn_gt(ssn.wrapping_add(1), self.next_ssn) {
+            let _old = self.next_ssn;
+            self.next_ssn = ssn.wrapping_add(1);
+            let remove: Vec<u16> = self
+                .pending
+                .keys()
+                .filter(|&&s| !ssn_gt(s, ssn))
+                .cloned()
+                .collect();
+            for s in remove {
+                self.pending.remove(&s);
+            }
+        }
+    }
+}
+
+fn tsn_gt(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
+
+fn ssn_gt(a: u16, b: u16) -> bool {
+    (a.wrapping_sub(b) as i16) > 0
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +125,8 @@ pub(crate) struct OutboundChunk {
     pub(crate) payload: Bytes,
     pub(crate) flags: u8,
     pub(crate) ssn: u16,
+    pub(crate) max_retransmits: Option<u16>,
+    pub(crate) expiry: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +266,9 @@ struct SctpInner {
     // Receiver Window Tracking
     used_rwnd: AtomicUsize,
 
+    // T3 timer state: prevent rapid re-fires
+    last_t3_fire_time: Mutex<Option<Instant>>,
+
     // Cached Timeout State
     cached_rto_timeout: Mutex<Option<(Instant, Duration)>>,
 
@@ -205,6 +281,24 @@ struct SctpInner {
 
     // Last SACK receive time (for RTO timeout error count handling)
     last_sack_time: Mutex<Option<Instant>>,
+
+    // T1 Timer (INIT / COOKIE-ECHO retransmission)
+    t1_chunk: Mutex<Option<(u8, Bytes, u32)>>, // (chunk_type, chunk_body, verification_tag)
+    t1_failures: AtomicU32,
+    t1_sent_time: Mutex<Option<Instant>>,
+    t1_active: AtomicBool,
+
+    // Cookie HMAC key
+    cookie_hmac_key: [u8; 16],
+
+    // Inbound stream state for ordered delivery
+    inbound_streams: Mutex<HashMap<u16, InboundStream>>,
+
+    // PR-SCTP: Advanced Peer Ack Point (RFC 3758)
+    advanced_peer_ack_tsn: AtomicU32,
+    forward_tsn_pending: AtomicBool,
+    forward_tsn_streams: Mutex<Vec<(u16, u16)>>,
+    has_pr_sctp: AtomicBool,
 
     // Statistics
     stats_bytes_sent: AtomicU64,
@@ -390,6 +484,8 @@ fn apply_sack_to_sent_queue(
                             .rtt_samples
                             .push(now.duration_since(record.sent_time).as_secs_f64());
                     }
+                    // Drop payload to free memory - gap-acked chunks won't be retransmitted
+                    record.payload = Bytes::new();
                 }
             }
         }
@@ -571,10 +667,26 @@ impl SctpTransport {
             heartbeat_sent_time: Mutex::new(None),
             consecutive_heartbeat_failures: AtomicU32::new(0),
             used_rwnd: AtomicUsize::new(0),
+            last_t3_fire_time: Mutex::new(None),
             cached_rto_timeout: Mutex::new(None),
             outbound_queue: Mutex::new(VecDeque::new()),
             queued_bytes: AtomicUsize::new(0),
             last_sack_time: Mutex::new(None),
+            t1_chunk: Mutex::new(None),
+            t1_failures: AtomicU32::new(0),
+            t1_sent_time: Mutex::new(None),
+            t1_active: AtomicBool::new(false),
+            cookie_hmac_key: {
+                let mut key = [0u8; 16];
+                use rand::RngCore;
+                rand::rng().fill_bytes(&mut key);
+                key
+            },
+            inbound_streams: Mutex::new(HashMap::new()),
+            advanced_peer_ack_tsn: AtomicU32::new(0),
+            forward_tsn_pending: AtomicBool::new(false),
+            forward_tsn_streams: Mutex::new(Vec::new()),
+            has_pr_sctp: AtomicBool::new(false),
             stats_bytes_sent: AtomicU64::new(0),
             stats_bytes_received: AtomicU64::new(0),
             stats_packets_sent: AtomicU64::new(0),
@@ -766,7 +878,25 @@ impl SctpInner {
                 (last_heartbeat + heartbeat_interval) - now
             };
 
-            let sleep_duration = rto_timeout.min(heartbeat_timeout);
+            // 3. Calculate T1 Timeout (only when T1 is active during connection setup)
+            let t1_timeout = if self.t1_active.load(Ordering::Relaxed) {
+                let t1_sent = self.t1_sent_time.lock().unwrap();
+                if let Some(sent) = *t1_sent {
+                    let rto = self.rto_state.lock().unwrap().rto;
+                    let expiry = sent + Duration::from_secs_f64(rto);
+                    if expiry > now {
+                        expiry - now
+                    } else {
+                        Duration::from_millis(1)
+                    }
+                } else {
+                    Duration::from_secs(3600)
+                }
+            } else {
+                Duration::from_secs(3600)
+            };
+
+            let sleep_duration = rto_timeout.min(heartbeat_timeout).min(t1_timeout);
 
             tokio::select! {
                 _ = close_rx.notified() => {
@@ -795,6 +925,11 @@ impl SctpInner {
                     }
                 },
                 _ = tokio::time::sleep(sleep_duration) => {
+                    // Check T1 Timer (INIT / COOKIE-ECHO retransmission)
+                    if let Err(e) = self.handle_t1_timeout().await {
+                        debug!("SCTP T1 timeout error: {}", e);
+                    }
+
                     // Check RTO Timer
                     // We check this regardless of whether sleep woke up due to RTO or SACK,
                     // because they might be close.
@@ -845,16 +980,122 @@ impl SctpInner {
         }
     }
 
+    async fn handle_t1_timeout(&self) -> Result<()> {
+        let now = Instant::now();
+        let should_fire = {
+            let sent = self.t1_sent_time.lock().unwrap();
+            if let Some(t) = *sent {
+                let rto = self.rto_state.lock().unwrap().rto;
+                now >= t + Duration::from_secs_f64(rto)
+            } else {
+                false
+            }
+        };
+        if !should_fire {
+            return Ok(());
+        }
+
+        let failures = self.t1_failures.fetch_add(1, Ordering::SeqCst) + 1;
+        debug!("SCTP T1 expired, failure count: {}", failures);
+
+        if failures > SCTP_MAX_INIT_RETRANS {
+            debug!("SCTP T1 max retransmissions exceeded, closing");
+            self.t1_cancel();
+            self.set_state(SctpState::Closed);
+            return Ok(());
+        }
+
+        self.rto_state.lock().unwrap().backoff();
+
+        let chunk_to_send = {
+            let t1 = self.t1_chunk.lock().unwrap();
+            t1.clone()
+        };
+
+        if let Some((chunk_type, chunk_body, vtag)) = chunk_to_send {
+            *self.t1_sent_time.lock().unwrap() = Some(now);
+            self.send_chunk(chunk_type, 0, chunk_body, vtag).await?;
+        }
+        Ok(())
+    }
+
+    fn t1_start(&self, chunk_type: u8, chunk_body: Bytes, vtag: u32) {
+        *self.t1_chunk.lock().unwrap() = Some((chunk_type, chunk_body, vtag));
+        self.t1_failures.store(0, Ordering::SeqCst);
+        *self.t1_sent_time.lock().unwrap() = Some(Instant::now());
+        self.t1_active.store(true, Ordering::SeqCst);
+    }
+
+    fn t1_cancel(&self) {
+        self.t1_active.store(false, Ordering::SeqCst);
+        *self.t1_chunk.lock().unwrap() = None;
+        *self.t1_sent_time.lock().unwrap() = None;
+        self.t1_failures.store(0, Ordering::SeqCst);
+    }
+
+    fn generate_cookie(&self) -> Vec<u8> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let timestamp = now_ms.to_be_bytes();
+        let mut mac =
+            HmacSha1::new_from_slice(&self.cookie_hmac_key).expect("HMAC key length is valid");
+        mac.update(&timestamp);
+        let result = mac.finalize();
+        let mut cookie = Vec::with_capacity(COOKIE_TOTAL_LEN);
+        cookie.extend_from_slice(&timestamp);
+        cookie.extend_from_slice(&result.into_bytes());
+        cookie
+    }
+
+    fn validate_cookie(&self, cookie: &[u8]) -> bool {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        if cookie.len() != COOKIE_TOTAL_LEN {
+            return false;
+        }
+        let timestamp = &cookie[..COOKIE_TIMESTAMP_LEN];
+        let received_mac = &cookie[COOKIE_TIMESTAMP_LEN..];
+        let mut mac =
+            HmacSha1::new_from_slice(&self.cookie_hmac_key).expect("HMAC key length is valid");
+        mac.update(timestamp);
+        if mac.verify_slice(received_mac).is_err() {
+            return false;
+        }
+        let stamp_ms = u64::from_be_bytes(timestamp.try_into().unwrap());
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if now_ms < stamp_ms || now_ms - stamp_ms > COOKIE_LIFETIME_MS {
+            return false;
+        }
+        true
+    }
+
     // aiortc-style T3 expiry logic
     async fn handle_timeout(&self) -> Result<()> {
         let now = Instant::now();
         let rto = { self.rto_state.lock().unwrap().rto };
+        let rto_dur = Duration::from_secs_f64(rto);
+        {
+            let last_fire = self.last_t3_fire_time.lock().unwrap();
+            if let Some(last) = *last_fire {
+                let since_last = now.duration_since(last);
+                // Must wait at least half the current RTO before re-firing
+                let min_interval = rto_dur / 2;
+                if since_last < min_interval {
+                    return Ok(());
+                }
+            }
+        }
 
         let mut t3_expired = false;
         {
             let sent_queue = self.sent_queue.lock().unwrap();
             for (_, record) in sent_queue.iter() {
-                if !record.acked && now >= record.sent_time + Duration::from_secs_f64(rto) {
+                if !record.acked && !record.abandoned && now >= record.sent_time + rto_dur {
                     t3_expired = true;
                     break;
                 }
@@ -865,8 +1106,14 @@ impl SctpInner {
             return Ok(());
         }
 
-        self.rto_state.lock().unwrap().backoff();
-        let new_rto = self.rto_state.lock().unwrap().rto;
+        // Record T3 fire time BEFORE backoff
+        *self.last_t3_fire_time.lock().unwrap() = Some(now);
+
+        let new_rto = {
+            let mut rto_state = self.rto_state.lock().unwrap();
+            rto_state.backoff();
+            rto_state.rto
+        };
         debug!(
             "SCTP T3 Expired. RTO Backoff -> {:.3}s, collapsing window",
             new_rto
@@ -882,27 +1129,44 @@ impl SctpInner {
             }
         }
 
+        const MAX_PER_TSN_T3_RETRANSMITS: u32 = 8;
+
         {
             let mut sent_queue = self.sent_queue.lock().unwrap();
-            let mut first_retransmitted = false;
+            let mut retransmitted_tsn = None;
+
             for (tsn, record) in sent_queue.iter_mut() {
                 if !record.acked && !record.abandoned {
                     // Mark all unacked packets as no longer in-flight
                     if record.in_flight {
                         record.in_flight = false;
                     }
-                    // RFC 4960 §6.3.3: Only retransmit the FIRST outstanding TSN.
-                    // Retransmitting ALL at once creates a burst that overwhelms
-                    // rate-limited relays, causing more drops and more T3 timeouts.
-                    if !first_retransmitted {
+
+                    if retransmitted_tsn.is_none() {
+                        // Check if this TSN has exceeded per-packet retransmit limit
+                        if record.transmit_count >= MAX_PER_TSN_T3_RETRANSMITS {
+                            // Abandon this TSN and try the next one
+                            record.abandoned = true;
+                            debug!(
+                                "T3: abandoning TSN {} after {} transmits (stuck on TURN relay)",
+                                tsn, record.transmit_count
+                            );
+                            continue;
+                        }
+
+                        // RFC 4960 §6.3.3: Only retransmit the FIRST outstanding TSN.
                         record.needs_retransmit = true;
                         record.transmit_count += 1;
-                        record.sent_time = now; // Reset timer so next handle_timeout doesn't re-fire immediately
-                        first_retransmitted = true;
+                        record.sent_time = now;
+                        retransmitted_tsn = Some(*tsn);
                         debug!(
                             "T3 retransmit: marking only TSN {} for retransmission (transmit #{})",
                             tsn, record.transmit_count
                         );
+                    } else {
+                        // Reset sent_time for ALL remaining unacked records to prevent
+                        // them from immediately triggering another T3 on the next tick.
+                        record.sent_time = now;
                     }
                 }
             }
@@ -970,7 +1234,10 @@ impl SctpInner {
         init_params.put_u16(5); // IPv4
         init_params.put_u16(0); // Padding
 
-        self.send_chunk(CT_INIT, 0, init_params.freeze(), 0).await
+        self.send_chunk(CT_INIT, 0, init_params.clone().freeze(), 0)
+            .await?;
+        self.t1_start(CT_INIT, init_params.freeze(), 0);
+        Ok(())
     }
 
     fn set_state(&self, new_state: SctpState) {
@@ -1118,9 +1385,8 @@ impl SctpInner {
         let local_tag = random_u32();
         self.verification_tag.store(local_tag, Ordering::SeqCst);
 
-        // Send INIT ACK
-        // We need to construct a cookie. For simplicity, we'll just echo back some dummy data.
-        let cookie = b"dummy_cookie";
+        // Generate HMAC-protected state cookie
+        let cookie = self.generate_cookie();
 
         let mut init_ack_params = BytesMut::new();
         // Initiate Tag
@@ -1150,7 +1416,7 @@ impl SctpInner {
         // State Cookie Parameter (Type 7)
         init_ack_params.put_u16(7);
         init_ack_params.put_u16(4 + cookie.len() as u16);
-        init_ack_params.put_slice(cookie);
+        init_ack_params.put_slice(&cookie);
         // Padding for cookie
         let padding = (4 - (cookie.len() % 4)) % 4;
         for _ in 0..padding {
@@ -1163,6 +1429,8 @@ impl SctpInner {
     }
 
     async fn handle_init_ack(&self, chunk: Bytes) -> Result<()> {
+        self.t1_cancel();
+
         let mut buf = chunk;
         if buf.remaining() < 16 {
             return Ok(());
@@ -1205,15 +1473,21 @@ impl SctpInner {
 
         if let Some(cookie_bytes) = cookie {
             let tag = self.remote_verification_tag.load(Ordering::SeqCst);
-            self.send_chunk(CT_COOKIE_ECHO, 0, cookie_bytes, tag)
+            self.send_chunk(CT_COOKIE_ECHO, 0, cookie_bytes.clone(), tag)
                 .await?;
+            self.t1_start(CT_COOKIE_ECHO, cookie_bytes, tag);
         }
 
         Ok(())
     }
 
     async fn handle_cookie_ack(&self, _chunk: Bytes) -> Result<()> {
+        self.t1_cancel();
         *self.state.lock().unwrap() = SctpState::Connected;
+        self.advanced_peer_ack_tsn.store(
+            self.next_tsn.load(Ordering::SeqCst).wrapping_sub(1),
+            Ordering::SeqCst,
+        );
 
         let channels_to_process = {
             let mut channels = self.data_channels.lock().unwrap();
@@ -1301,28 +1575,31 @@ impl SctpInner {
                 }
             };
 
-            // Log SACK receipt with flight size and queue info
-            let current_flight = self.flight_size.load(Ordering::SeqCst);
-            let queue_len = self.sent_queue.lock().unwrap().len();
-            if !gap_blocks.is_empty() {
-                trace!(
-                    "Received SACK: cum_ack={}, a_rwnd={}, gaps={}, flight={}, queue={}",
-                    cumulative_tsn_ack,
-                    a_rwnd,
-                    gap_blocks.len(),
-                    current_flight,
-                    queue_len
-                );
-            } else {
-                trace!(
-                    "Received SACK: cum_ack={}, a_rwnd={}, flight={}, queue={}",
-                    cumulative_tsn_ack, a_rwnd, current_flight, queue_len
-                );
-            }
-
             let now = Instant::now();
             let outcome = {
                 let mut sent_queue = self.sent_queue.lock().unwrap();
+
+                // Log SACK receipt with flight size and queue info (inside same lock)
+                let current_flight = self.flight_size.load(Ordering::SeqCst);
+                if !gap_blocks.is_empty() {
+                    trace!(
+                        "Received SACK: cum_ack={}, a_rwnd={}, gaps={}, flight={}, queue={}",
+                        cumulative_tsn_ack,
+                        a_rwnd,
+                        gap_blocks.len(),
+                        current_flight,
+                        sent_queue.len()
+                    );
+                } else {
+                    trace!(
+                        "Received SACK: cum_ack={}, a_rwnd={}, flight={}, queue={}",
+                        cumulative_tsn_ack,
+                        a_rwnd,
+                        current_flight,
+                        sent_queue.len()
+                    );
+                }
+
                 apply_sack_to_sent_queue(
                     &mut *sent_queue,
                     cumulative_tsn_ack,
@@ -1340,12 +1617,14 @@ impl SctpInner {
 
             if outcome.bytes_acked_by_cum_tsn > 0 || !outcome.rtt_samples.is_empty() {
                 self.association_error_count.store(0, Ordering::SeqCst);
+                // Reset T3 fire guard on successful SACK progress
+                *self.last_t3_fire_time.lock().unwrap() = None;
 
                 let ssthresh = self.ssthresh.load(Ordering::SeqCst);
                 if ssthresh <= SSTHRESH_MIN && outcome.bytes_acked_by_cum_tsn > 0 {
-                    let cwnd = self.cwnd_tx.load(Ordering::SeqCst); // Use TX congestion window
+                    let cwnd = self.cwnd_tx.load(Ordering::SeqCst);
                     if cwnd >= ssthresh * 4 / 5 {
-                        let new_ssthresh = (cwnd * 2).max(CWND_INITIAL * 2);
+                        let new_ssthresh = (cwnd * 2).max(CWND_INITIAL * 2).min(MAX_CWND);
                         self.ssthresh.store(new_ssthresh, Ordering::SeqCst);
                         debug!(
                             "Raising ssthresh {} -> {} to allow faster recovery (cwnd={})",
@@ -1437,17 +1716,18 @@ impl SctpInner {
                     let done_bytes = outcome.bytes_acked_by_cum_tsn + outcome.bytes_acked_by_gap;
                     let cwnd_fully_utilized = self.flight_size.load(Ordering::SeqCst) >= cwnd;
 
-                    if done_bytes > 0 && cwnd_fully_utilized {
+                    if done_bytes > 0 && cwnd_fully_utilized && cwnd < MAX_CWND {
                         if cwnd <= ssthresh {
                             // Slow Start (aiortc): cwnd += min(done_bytes, MTU)
                             let increase = done_bytes.min(MAX_SCTP_PACKET_SIZE);
-                            let old_cwnd = self.cwnd_tx.fetch_add(increase, Ordering::SeqCst);
+                            let new_cwnd = (cwnd + increase).min(MAX_CWND);
+                            let actual_increase = new_cwnd - cwnd;
+                            if actual_increase > 0 {
+                                self.cwnd_tx.fetch_add(actual_increase, Ordering::SeqCst);
+                            }
                             debug!(
                                 "Congestion Control: Slow Start cwnd_tx {} -> {} (ssthresh={}, increase={})",
-                                old_cwnd,
-                                old_cwnd + increase,
-                                ssthresh,
-                                increase
+                                cwnd, new_cwnd, ssthresh, actual_increase
                             );
                         } else {
                             // Congestion Avoidance: cwnd += MTU per RTT
@@ -1457,15 +1737,14 @@ impl SctpInner {
                             let total_pba = pba + done_bytes;
                             if total_pba >= cwnd {
                                 self.partial_bytes_acked.fetch_sub(cwnd, Ordering::SeqCst);
-                                let old_cwnd = self
-                                    .cwnd_tx
-                                    .fetch_add(MAX_SCTP_PACKET_SIZE, Ordering::SeqCst);
+                                let new_cwnd = (cwnd + MAX_SCTP_PACKET_SIZE).min(MAX_CWND);
+                                let actual_increase = new_cwnd - cwnd;
+                                if actual_increase > 0 {
+                                    self.cwnd_tx.fetch_add(actual_increase, Ordering::SeqCst);
+                                }
                                 debug!(
                                     "Congestion Control: Congestion Avoidance cwnd_tx {} -> {} (ssthresh={}, pba={})",
-                                    old_cwnd,
-                                    old_cwnd + MAX_SCTP_PACKET_SIZE,
-                                    ssthresh,
-                                    total_pba
+                                    cwnd, new_cwnd, ssthresh, total_pba
                                 );
                             }
                         }
@@ -1559,12 +1838,21 @@ impl SctpInner {
         Ok(())
     }
 
-    async fn handle_cookie_echo(&self, _chunk: Bytes) -> Result<()> {
+    async fn handle_cookie_echo(&self, chunk: Bytes) -> Result<()> {
+        if !self.validate_cookie(&chunk) {
+            debug!("SCTP: Invalid or expired cookie, ignoring COOKIE-ECHO");
+            return Ok(());
+        }
+
         // Send COOKIE ACK
         let tag = self.remote_verification_tag.load(Ordering::SeqCst);
         self.send_chunk(CT_COOKIE_ACK, 0, Bytes::new(), tag).await?;
 
         *self.state.lock().unwrap() = SctpState::Connected;
+        self.advanced_peer_ack_tsn.store(
+            self.next_tsn.load(Ordering::SeqCst).wrapping_sub(1),
+            Ordering::SeqCst,
+        );
 
         let channels_to_process = {
             let mut channels = self.data_channels.lock().unwrap();
@@ -1605,6 +1893,14 @@ impl SctpInner {
         let mut buf = chunk;
         let new_cumulative_tsn = buf.get_u32();
 
+        // Parse per-stream SSN pairs (4 bytes each: stream_id u16 + ssn u16)
+        let mut stream_ssn_pairs = Vec::new();
+        while buf.remaining() >= 4 {
+            let sid = buf.get_u16();
+            let ssn = buf.get_u16();
+            stream_ssn_pairs.push((sid, ssn));
+        }
+
         let old_cumulative_tsn = self.cumulative_tsn_ack.load(Ordering::SeqCst);
         if new_cumulative_tsn > old_cumulative_tsn {
             debug!(
@@ -1614,13 +1910,36 @@ impl SctpInner {
             self.cumulative_tsn_ack
                 .store(new_cumulative_tsn, Ordering::SeqCst);
 
-            // Remove skipped packets from received_queue
             {
                 let mut received_queue = self.received_queue.lock().unwrap();
                 received_queue.retain(|&tsn, _| tsn > new_cumulative_tsn);
             }
 
-            // Trigger processing of any now-contiguous packets
+            // Advance SSNs for ordered streams
+            if !stream_ssn_pairs.is_empty() {
+                let mut streams = self.inbound_streams.lock().unwrap();
+                for (sid, ssn) in &stream_ssn_pairs {
+                    if let Some(stream) = streams.get_mut(sid) {
+                        stream.advance_ssn_to(*ssn);
+                        // Deliver any messages that are now ready
+                        let ready = stream.drain_ready();
+                        if !ready.is_empty() {
+                            let channels = self.data_channels.lock().unwrap();
+                            for weak_dc in channels.iter() {
+                                if let Some(dc) = weak_dc.upgrade() {
+                                    if dc.id == *sid {
+                                        for m in &ready {
+                                            dc.send_event(DataChannelEvent::Message(m.clone()));
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             self.timer_notify.notify_one();
         }
 
@@ -1691,6 +2010,18 @@ impl SctpInner {
                         dc.next_ssn.store(0, Ordering::SeqCst);
                         debug!("Reset SSN for stream {}", dc.id);
                     }
+                }
+            }
+        }
+
+        // Reset inbound stream state for affected streams
+        {
+            let mut inbound = self.inbound_streams.lock().unwrap();
+            if streams.is_empty() {
+                inbound.clear();
+            } else {
+                for &sid in &streams {
+                    inbound.remove(&sid);
                 }
             }
         }
@@ -1779,7 +2110,13 @@ impl SctpInner {
         // 2. Send RE-CONFIG SSN Reset
         self.send_reconfig_ssn_reset(&[channel_id]).await?;
 
-        // 3. Set state to Closed
+        // 3. Clean up inbound stream state
+        {
+            let mut streams = self.inbound_streams.lock().unwrap();
+            streams.remove(&channel_id);
+        }
+
+        // 4. Set state to Closed
         {
             let channels = self.data_channels.lock().unwrap();
             if let Some(dc) = channels
@@ -1911,17 +2248,7 @@ impl SctpInner {
         if diff == 1 {
             let is_queue_empty = self.received_queue.lock().unwrap().is_empty();
             if is_queue_empty {
-                // Collect channel info once
-                let channel_map: std::collections::HashMap<u16, Arc<DataChannel>> = {
-                    let channels = self.data_channels.lock().unwrap();
-                    channels
-                        .iter()
-                        .filter_map(|w| w.upgrade().map(|dc| (dc.id, dc)))
-                        .collect()
-                };
-
-                self.process_data_payload(flags, chunk, &channel_map)
-                    .await?;
+                self.process_data_payload(flags, chunk).await?;
                 self.cumulative_tsn_ack.store(tsn, Ordering::Relaxed);
                 self.sack_needed.store(true, Ordering::Relaxed);
                 return Ok(());
@@ -1955,13 +2282,6 @@ impl SctpInner {
 
         if !to_process.is_empty() {
             trace!("SCTP processing batch of {} data chunks", to_process.len());
-            let channel_map: std::collections::HashMap<u16, Arc<DataChannel>> = {
-                let channels = self.data_channels.lock().unwrap();
-                channels
-                    .iter()
-                    .filter_map(|w| w.upgrade().map(|dc| (dc.id, dc)))
-                    .collect()
-            };
 
             for (p_flags, p_chunk) in to_process {
                 let chunk_len = p_chunk.len();
@@ -1970,8 +2290,7 @@ impl SctpInner {
                     .load(Ordering::Relaxed)
                     .wrapping_add(1);
 
-                self.process_data_payload(p_flags, p_chunk, &channel_map)
-                    .await?;
+                self.process_data_payload(p_flags, p_chunk).await?;
                 self.cumulative_tsn_ack.store(next_tsn, Ordering::Relaxed);
                 self.used_rwnd.fetch_sub(chunk_len, Ordering::Relaxed);
             }
@@ -1981,32 +2300,51 @@ impl SctpInner {
         Ok(())
     }
 
-    async fn process_data_payload(
-        &self,
-        flags: u8,
-        chunk: Bytes,
-        channel_map: &std::collections::HashMap<u16, Arc<DataChannel>>,
-    ) -> Result<()> {
+    async fn process_data_payload(&self, flags: u8, chunk: Bytes) -> Result<()> {
         let mut buf = chunk;
         // Skip TSN (4 bytes)
         buf.advance(4);
 
         let stream_id = buf.get_u16();
-        let _stream_seq = buf.get_u16();
+        let stream_seq = buf.get_u16();
         let payload_proto = buf.get_u32();
 
         let user_data = buf;
 
         if payload_proto == DATA_CHANNEL_PPID_DCEP {
+            // If this DCEP message was sent ordered (U-bit not set), we must
+            // still advance the InboundStream SSN so subsequent data messages
+            // on this stream are delivered correctly.  DCEP messages are not
+            // routed through InboundStream, but they consume an SSN on the
+            // sender side when sent ordered.
+            let unordered = (flags & 0x04) != 0;
+            if !unordered {
+                let mut streams = self.inbound_streams.lock().unwrap();
+                let stream = streams.entry(stream_id).or_insert_with(InboundStream::new);
+                // Treat it like a delivered message: enqueue and discard the
+                // result (DCEP payload is handled separately below).
+                let _ready = stream.enqueue(stream_seq, Bytes::new());
+                // Note: _ready should be empty (the Bytes::new() placeholder)
+                // or contain previously-buffered messages that are now
+                // deliverable, but DCEP messages arrive before any data
+                // channel exists, so there shouldn't be anything to deliver.
+            }
             self.handle_dcep(stream_id, user_data).await?;
             return Ok(());
         }
 
-        if let Some(dc) = channel_map.get(&stream_id) {
-            // Handle fragmentation
-            // B bit: 0x02, E bit: 0x01
+        // Direct lookup: find the channel by stream_id without building a HashMap
+        let dc = {
+            let channels = self.data_channels.lock().unwrap();
+            channels
+                .iter()
+                .find_map(|w| w.upgrade().filter(|d| d.id == stream_id))
+        };
+
+        if let Some(dc) = dc {
             let b_bit = (flags & 0x02) != 0;
             let e_bit = (flags & 0x01) != 0;
+            let unordered = (flags & 0x04) != 0;
 
             let mut buffer = dc.reassembly_buffer.lock().unwrap();
             if b_bit {
@@ -2015,21 +2353,24 @@ impl SctpInner {
                         "SCTP Reassembly: unexpected B bit, clearing buffer of size {}",
                         buffer.len()
                     );
-                    // Note: used_rwnd for previous fragments was already freed when they were
-                    // removed from received_queue in handle_data_packet. The reassembly buffer
-                    // just holds references to already-accounted data, so no adjustment needed.
                 }
                 buffer.clear();
             }
-            // RFC 4960: used_rwnd tracks data in the receive buffer (received_queue).
-            // Data has already been accounted for when it entered received_queue.
-            // The reassembly buffer is just a staging area - don't double-count.
             buffer.extend_from_slice(&user_data);
             if e_bit {
                 let msg = std::mem::take(&mut *buffer).freeze();
-                // Message delivered to application - rwnd already freed when chunks
-                // were removed from received_queue in handle_data_packet
-                dc.send_event(DataChannelEvent::Message(msg));
+                drop(buffer);
+
+                if unordered || !dc.ordered {
+                    dc.send_event(DataChannelEvent::Message(msg));
+                } else {
+                    let mut streams = self.inbound_streams.lock().unwrap();
+                    let stream = streams.entry(stream_id).or_insert_with(InboundStream::new);
+                    let ready = stream.enqueue(stream_seq, msg);
+                    for m in ready {
+                        dc.send_event(DataChannelEvent::Message(m));
+                    }
+                }
             }
         } else {
             debug!("SCTP: Received data for unknown stream id {}", stream_id);
@@ -2277,6 +2618,8 @@ impl SctpInner {
         let is_dcep = ppid == DATA_CHANNEL_PPID_DCEP;
         let mut ordered = !is_dcep;
         let mut max_payload_size = DEFAULT_MAX_PAYLOAD_SIZE;
+        let mut max_retransmits: Option<u16> = None;
+        let mut expiry: Option<Instant> = None;
 
         let (_guard, ssn) = if let Some(dc) = &dc_opt {
             let guard = dc.send_lock.lock().await;
@@ -2287,6 +2630,16 @@ impl SctpInner {
                 0
             };
             max_payload_size = dc.max_payload_size.min(DEFAULT_MAX_PAYLOAD_SIZE);
+            if !is_dcep {
+                max_retransmits = dc.max_retransmits;
+                if let Some(lifetime_ms) = dc.max_packet_life_time {
+                    expiry = Some(Instant::now() + Duration::from_millis(lifetime_ms as u64));
+                }
+                // Track PR-SCTP usage for fast-path skip in transmit()
+                if max_retransmits.is_some() || expiry.is_some() {
+                    self.has_pr_sctp.store(true, Ordering::Relaxed);
+                }
+            }
             (Some(guard), ssn)
         } else {
             // Check if we should error if channel not found or not open
@@ -2330,6 +2683,8 @@ impl SctpInner {
                 payload: Bytes::new(),
                 flags: flags_base | 0x03, // B=1, E=1
                 ssn,
+                max_retransmits,
+                expiry,
             };
             self.outbound_queue.lock().unwrap().push_back(chunk);
             self.timer_notify.notify_one();
@@ -2360,6 +2715,8 @@ impl SctpInner {
                 payload,
                 flags,
                 ssn,
+                max_retransmits,
+                expiry,
             };
             queue.push_back(chunk);
 
@@ -2476,6 +2833,11 @@ impl SctpInner {
                     fast_retransmit_time: None,
                     in_flight: true,
                     acked: false,
+                    stream_id: chunk_info.stream_id,
+                    ssn: chunk_info.ssn,
+                    flags: chunk_info.flags,
+                    max_retransmits: chunk_info.max_retransmits,
+                    expiry: chunk_info.expiry,
                 };
 
                 sent.insert(tsn, record);
@@ -2485,11 +2847,169 @@ impl SctpInner {
             }
         }
 
+        // PR-SCTP: check for abandoned chunks and send FORWARD-TSN
+        // Only scan when PR-SCTP channels exist (max_retransmits or expiry set)
+        if self.has_pr_sctp.load(Ordering::Relaxed) {
+            self.update_advanced_peer_ack_point();
+            if self.forward_tsn_pending.swap(false, Ordering::SeqCst) {
+                if let Some(fwd_chunk) = self.create_forward_tsn_chunk() {
+                    chunks_to_send.push(fwd_chunk);
+                }
+            }
+        }
+
         if !chunks_to_send.is_empty() {
             self.transmit_chunks(chunks_to_send).await?;
         }
 
         Ok(())
+    }
+
+    fn should_abandon(record: &ChunkRecord) -> bool {
+        if record.abandoned {
+            return true;
+        }
+        if let Some(max_r) = record.max_retransmits {
+            if record.transmit_count > max_r as u32 {
+                return true;
+            }
+        }
+        if let Some(exp) = record.expiry {
+            if Instant::now() > exp {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn update_advanced_peer_ack_point(&self) {
+        let mut sent_queue = self.sent_queue.lock().unwrap();
+
+        // First: check all unacked chunks for abandonment
+        let mut abandon_messages: Vec<(u16, u16)> = Vec::new();
+        for (_tsn, record) in sent_queue.iter_mut() {
+            if record.acked || record.abandoned {
+                continue;
+            }
+            if Self::should_abandon(record) {
+                abandon_messages.push((record.stream_id, record.ssn));
+            }
+        }
+
+        // Mark all chunks of abandoned messages
+        for (sid, ssn) in &abandon_messages {
+            for (_, record) in sent_queue.iter_mut() {
+                if record.stream_id == *sid && record.ssn == *ssn {
+                    record.abandoned = true;
+                    record.needs_retransmit = false;
+                    if record.in_flight {
+                        record.in_flight = false;
+                        let len = record.payload.len();
+                        let _ = self.flight_size.fetch_update(
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                            |f| Some(f.saturating_sub(len)),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Advance the advanced peer ack point past consecutive abandoned chunks
+        let last_sacked = self.cumulative_tsn_ack.load(Ordering::SeqCst);
+        let mut advanced = self.advanced_peer_ack_tsn.load(Ordering::SeqCst);
+        if tsn_gt(last_sacked, advanced) {
+            advanced = last_sacked;
+        }
+
+        let mut new_advanced = advanced;
+        let mut has_abandoned = false;
+        let tsns: Vec<u32> = sent_queue.keys().cloned().collect();
+        for tsn in tsns {
+            if !tsn_gt(tsn, new_advanced) && tsn != new_advanced.wrapping_add(1) {
+                continue;
+            }
+            if tsn != new_advanced.wrapping_add(1) {
+                break;
+            }
+            if let Some(record) = sent_queue.get(&tsn) {
+                if record.abandoned {
+                    new_advanced = tsn;
+                    has_abandoned = true;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if has_abandoned && tsn_gt(new_advanced, advanced) {
+            self.advanced_peer_ack_tsn
+                .store(new_advanced, Ordering::SeqCst);
+            self.forward_tsn_pending.store(true, Ordering::SeqCst);
+            // Collect stream/SSN pairs for FORWARD-TSN before removing
+            let mut stream_ssn: HashMap<u16, u16> = HashMap::new();
+            let remove: Vec<u32> = sent_queue
+                .keys()
+                .filter(|&&t| !tsn_gt(t, new_advanced))
+                .cloned()
+                .collect();
+            for &t in &remove {
+                if let Some(record) = sent_queue.get(&t) {
+                    if record.abandoned {
+                        let e = stream_ssn.entry(record.stream_id).or_insert(0);
+                        if ssn_gt(record.ssn, *e) || *e == 0 {
+                            *e = record.ssn;
+                        }
+                    }
+                }
+            }
+            {
+                let mut fwd = self.forward_tsn_streams.lock().unwrap();
+                *fwd = stream_ssn.into_iter().collect();
+            }
+            for t in remove {
+                sent_queue.remove(&t);
+            }
+            debug!(
+                "PR-SCTP: advanced peer ack point {} -> {}",
+                advanced, new_advanced
+            );
+        }
+    }
+
+    fn create_forward_tsn_chunk(&self) -> Option<Bytes> {
+        let advanced = self.advanced_peer_ack_tsn.load(Ordering::SeqCst);
+        let last_sacked = self.cumulative_tsn_ack.load(Ordering::SeqCst);
+        if !tsn_gt(advanced, last_sacked) {
+            return None;
+        }
+
+        let stream_ssn_pairs: Vec<(u16, u16)> = {
+            let mut fwd = self.forward_tsn_streams.lock().unwrap();
+            std::mem::take(&mut *fwd)
+        };
+
+        let pair_bytes = stream_ssn_pairs.len() * 4;
+        let mut body = BytesMut::with_capacity(4 + pair_bytes);
+        body.put_u32(advanced);
+        for (sid, ssn) in &stream_ssn_pairs {
+            body.put_u16(*sid);
+            body.put_u16(*ssn);
+        }
+
+        let body_len = body.len();
+        let chunk_len = CHUNK_HEADER_SIZE + body_len;
+        let padding = (4 - (chunk_len % 4)) % 4;
+        let mut chunk_buf = BytesMut::with_capacity(chunk_len + padding);
+        chunk_buf.put_u8(CT_FORWARD_TSN);
+        chunk_buf.put_u8(0);
+        chunk_buf.put_u16(chunk_len as u16);
+        chunk_buf.put(body);
+        for _ in 0..padding {
+            chunk_buf.put_u8(0);
+        }
+
+        Some(chunk_buf.freeze())
     }
 
     fn create_data_chunk(
@@ -2794,6 +3314,11 @@ mod tests {
                 needs_retransmit: false,
                 in_flight: true,
                 acked: false,
+                stream_id: 0,
+                ssn: 0,
+                flags: 0x03,
+                max_retransmits: None,
+                expiry: None,
             },
         );
         sent.insert(
@@ -2809,6 +3334,11 @@ mod tests {
                 needs_retransmit: false,
                 in_flight: true,
                 acked: false,
+                stream_id: 0,
+                ssn: 0,
+                flags: 0x03,
+                max_retransmits: None,
+                expiry: None,
             },
         );
         sent.insert(
@@ -2824,6 +3354,11 @@ mod tests {
                 needs_retransmit: false,
                 in_flight: true,
                 acked: false,
+                stream_id: 0,
+                ssn: 0,
+                flags: 0x03,
+                max_retransmits: None,
+                expiry: None,
             },
         );
 
@@ -2859,6 +3394,11 @@ mod tests {
                     needs_retransmit: false,
                     in_flight: true,
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                 },
             );
         }
@@ -2966,6 +3506,11 @@ mod tests {
                     needs_retransmit: false,
                     in_flight: true,
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                 },
             );
         }
@@ -2994,6 +3539,9 @@ mod tests {
             let record = sent_queue.get_mut(&100).unwrap();
             record.sent_time = Instant::now() - Duration::from_secs(10);
         }
+
+        // Reset the T3 fire guard so the second timeout can fire in the test
+        *sctp.inner.last_t3_fire_time.lock().unwrap() = None;
 
         // Second timeout: error_count becomes 2, transmit_count becomes 3
         sctp.inner.handle_timeout().await.unwrap();
@@ -3057,6 +3605,11 @@ mod tests {
                     needs_retransmit: false,
                     in_flight: true,
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                 },
             );
 
@@ -3075,6 +3628,11 @@ mod tests {
                         needs_retransmit: false,
                         in_flight: true,
                         acked: false,
+                        stream_id: 0,
+                        ssn: 0,
+                        flags: 0x03,
+                        max_retransmits: None,
+                        expiry: None,
                     },
                 );
             }
@@ -3113,6 +3671,11 @@ mod tests {
                         needs_retransmit: false,
                         in_flight: true,
                         acked: false,
+                        stream_id: 0,
+                        ssn: 0,
+                        flags: 0x03,
+                        max_retransmits: None,
+                        expiry: None,
                     },
                 );
 
@@ -3131,6 +3694,11 @@ mod tests {
                             needs_retransmit: false,
                             in_flight: true,
                             acked: false,
+                            stream_id: 0,
+                            ssn: 0,
+                            flags: 0x03,
+                            max_retransmits: None,
+                            expiry: None,
                         },
                     );
                 }
@@ -3330,6 +3898,11 @@ mod tests {
                             needs_retransmit: false,
                             in_flight: true,
                             acked: false,
+                            stream_id: 0,
+                            ssn: 0,
+                            flags: 0x03,
+                            max_retransmits: None,
+                            expiry: None,
                         },
                     );
                 }
@@ -3483,6 +4056,11 @@ mod tests {
                     needs_retransmit: false,
                     in_flight: true,
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                 },
             );
         }
@@ -3560,6 +4138,11 @@ mod tests {
                     needs_retransmit: false,
                     in_flight: true,
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                 },
             );
         }
@@ -3636,6 +4219,11 @@ mod tests {
                     needs_retransmit: false,
                     in_flight: true,
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                 },
             );
         }
@@ -3764,6 +4352,11 @@ mod tests {
                     payload: payload1.clone(),
                     sent_time: Instant::now() - Duration::from_secs(10),
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                     abandoned: false,
                     transmit_count: 0,
                     in_flight: true,
@@ -3779,6 +4372,11 @@ mod tests {
                     payload: payload2.clone(),
                     sent_time: Instant::now() - Duration::from_secs(10),
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                     abandoned: false,
                     transmit_count: 0,
                     in_flight: true,
@@ -4088,6 +4686,11 @@ mod tests {
             needs_retransmit: false,
             in_flight: false,
             acked: false,
+            stream_id: 0,
+            ssn: 0,
+            flags: 0x03,
+            max_retransmits: None,
+            expiry: None,
         };
 
         // Simulate drain_retransmissions logic (current buggy behavior)
@@ -4146,6 +4749,11 @@ mod tests {
             needs_retransmit: false,
             in_flight: true, // Already sent
             acked: false,
+            stream_id: 0,
+            ssn: 0,
+            flags: 0x03,
+            max_retransmits: None,
+            expiry: None,
         };
 
         // Packet is in_flight but transmit_count is still 0
@@ -4186,6 +4794,11 @@ mod tests {
                 needs_retransmit: false,
                 in_flight: false,
                 acked: false,
+                stream_id: 0,
+                ssn: 0,
+                flags: 0x03,
+                max_retransmits: None,
+                expiry: None,
             },
         );
 
@@ -4283,6 +4896,11 @@ mod tests {
                     needs_retransmit: false,
                     in_flight: true,
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                 },
             );
         }
@@ -4366,6 +4984,11 @@ mod tests {
                     needs_retransmit: false,
                     in_flight: true,
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                 },
             );
         }
@@ -4441,6 +5064,11 @@ mod tests {
                         needs_retransmit: false,
                         in_flight: true,
                         acked: false,
+                        stream_id: 0,
+                        ssn: 0,
+                        flags: 0x03,
+                        max_retransmits: None,
+                        expiry: None,
                     },
                 );
             }
@@ -4529,6 +5157,11 @@ mod tests {
                     fast_retransmit_time: Some(Instant::now() - Duration::from_millis(100)),
                     in_flight: true,
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                 },
             );
 
@@ -4547,6 +5180,11 @@ mod tests {
                         needs_retransmit: false,
                         in_flight: true,
                         acked: false,
+                        stream_id: 0,
+                        ssn: 0,
+                        flags: 0x03,
+                        max_retransmits: None,
+                        expiry: None,
                     },
                 );
             }
@@ -4643,6 +5281,11 @@ mod tests {
                     fast_retransmit_time: Some(Instant::now() - Duration::from_millis(500)),
                     in_flight: true,
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                 },
             );
 
@@ -4661,6 +5304,11 @@ mod tests {
                         needs_retransmit: false,
                         in_flight: true,
                         acked: false,
+                        stream_id: 0,
+                        ssn: 0,
+                        flags: 0x03,
+                        max_retransmits: None,
+                        expiry: None,
                     },
                 );
             }
@@ -4757,6 +5405,11 @@ mod tests {
                         needs_retransmit: false,
                         in_flight: true,
                         acked: false,
+                        stream_id: 0,
+                        ssn: 0,
+                        flags: 0x03,
+                        max_retransmits: None,
+                        expiry: None,
                     },
                 );
             }
@@ -4864,6 +5517,11 @@ mod tests {
                     needs_retransmit: false,
                     in_flight: true,
                     acked: tsn != 10,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                 },
             );
         }
@@ -4939,6 +5597,11 @@ mod tests {
                 needs_retransmit: false,
                 in_flight: true,
                 acked: false,
+                stream_id: 0,
+                ssn: 0,
+                flags: 0x03,
+                max_retransmits: None,
+                expiry: None,
             },
         );
         for tsn in 21..=23 {
@@ -4955,6 +5618,11 @@ mod tests {
                     needs_retransmit: false,
                     in_flight: true,
                     acked: false,
+                    stream_id: 0,
+                    ssn: 0,
+                    flags: 0x03,
+                    max_retransmits: None,
+                    expiry: None,
                 },
             );
         }
@@ -5076,5 +5744,456 @@ mod tests {
 
         println!("✅ cwnd recovers properly after repeated losses");
         println!("✅ Burst limit returns to 4*MTU after fast recovery exit");
+    }
+
+    // ===== T1 Timer Tests =====
+
+    #[test]
+    fn test_t1_timer_fields_default() {
+        // Verify T1 timer-related atomics and mutexes work correctly
+        let t1_chunk: Mutex<Option<(u8, Bytes, u32)>> = Mutex::new(None);
+        let t1_failures = AtomicU32::new(0);
+        let t1_sent_time: Mutex<Option<Instant>> = Mutex::new(None);
+
+        assert!(t1_chunk.lock().unwrap().is_none());
+        assert!(t1_sent_time.lock().unwrap().is_none());
+        assert_eq!(t1_failures.load(Ordering::SeqCst), 0);
+
+        // Simulate t1_start
+        let chunk = Bytes::from_static(b"INIT");
+        *t1_chunk.lock().unwrap() = Some((1, chunk.clone(), 0));
+        *t1_sent_time.lock().unwrap() = Some(Instant::now());
+
+        assert!(t1_chunk.lock().unwrap().is_some());
+        let (ctype, data, _tag) = t1_chunk.lock().unwrap().clone().unwrap();
+        assert_eq!(ctype, 1);
+        assert_eq!(data, chunk);
+
+        // Simulate t1_cancel
+        *t1_chunk.lock().unwrap() = None;
+        *t1_sent_time.lock().unwrap() = None;
+        t1_failures.store(0, Ordering::SeqCst);
+
+        assert!(t1_chunk.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_t1_failure_count_limits() {
+        let failures = AtomicU32::new(0);
+        for i in 0..SCTP_MAX_INIT_RETRANS {
+            failures.fetch_add(1, Ordering::SeqCst);
+            assert!(failures.load(Ordering::SeqCst) <= SCTP_MAX_INIT_RETRANS as u32);
+        }
+        assert_eq!(
+            failures.load(Ordering::SeqCst),
+            SCTP_MAX_INIT_RETRANS as u32
+        );
+    }
+
+    // ===== Secure Cookie Tests =====
+
+    #[test]
+    fn test_cookie_hmac_generation() {
+        use hmac::{Hmac, Mac};
+        use sha1::Sha1;
+        type TestHmac = Hmac<Sha1>;
+
+        let key = [0x42u8; 16];
+        let timestamp = 12345u64;
+
+        let mut mac = TestHmac::new_from_slice(&key).expect("HMAC key");
+        mac.update(&timestamp.to_be_bytes());
+        let hmac_result = mac.finalize().into_bytes();
+        assert_eq!(hmac_result.len(), COOKIE_HMAC_LEN);
+
+        // Verify: same key + timestamp = same HMAC
+        let mut mac2 = TestHmac::new_from_slice(&key).expect("HMAC key");
+        mac2.update(&timestamp.to_be_bytes());
+        let hmac_result2 = mac2.finalize().into_bytes();
+        assert_eq!(hmac_result, hmac_result2);
+
+        // Different key = different HMAC
+        let key2 = [0x43u8; 16];
+        let mut mac3 = TestHmac::new_from_slice(&key2).expect("HMAC key");
+        mac3.update(&timestamp.to_be_bytes());
+        let hmac_result3 = mac3.finalize().into_bytes();
+        assert_ne!(hmac_result.as_slice(), hmac_result3.as_slice());
+    }
+
+    #[test]
+    fn test_cookie_format_and_validation_logic() {
+        use hmac::{Hmac, Mac};
+        use sha1::Sha1;
+        type TestHmac = Hmac<Sha1>;
+
+        let key = [0x55u8; 16];
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Build cookie
+        let mut cookie = Vec::with_capacity(COOKIE_TOTAL_LEN);
+        cookie.extend_from_slice(&now_ms.to_be_bytes());
+        let mut mac = TestHmac::new_from_slice(&key).expect("HMAC key");
+        mac.update(&now_ms.to_be_bytes());
+        let hmac_result = mac.finalize().into_bytes();
+        cookie.extend_from_slice(&hmac_result);
+        assert_eq!(cookie.len(), COOKIE_TOTAL_LEN);
+
+        // Validate
+        let ts_bytes: [u8; 8] = cookie[..COOKIE_TIMESTAMP_LEN].try_into().unwrap();
+        let ts = u64::from_be_bytes(ts_bytes);
+        assert_eq!(ts, now_ms);
+
+        let mut verifier = TestHmac::new_from_slice(&key).expect("HMAC key");
+        verifier.update(&ts.to_be_bytes());
+        assert!(
+            verifier
+                .verify_slice(&cookie[COOKIE_TIMESTAMP_LEN..])
+                .is_ok()
+        );
+
+        // Tampered cookie fails
+        let mut bad_cookie = cookie.clone();
+        bad_cookie[COOKIE_TOTAL_LEN - 1] ^= 0xFF;
+        let mut verifier2 = TestHmac::new_from_slice(&key).expect("HMAC key");
+        verifier2.update(&ts.to_be_bytes());
+        assert!(
+            verifier2
+                .verify_slice(&bad_cookie[COOKIE_TIMESTAMP_LEN..])
+                .is_err()
+        );
+    }
+
+    // ===== PR-SCTP Tests =====
+
+    #[test]
+    fn test_should_abandon_by_retransmit_count() {
+        let record = ChunkRecord {
+            payload: Bytes::from_static(b"data"),
+            sent_time: Instant::now(),
+            transmit_count: 3,
+            missing_reports: 0,
+            abandoned: false,
+            fast_retransmit: false,
+            fast_retransmit_time: None,
+            needs_retransmit: false,
+            in_flight: true,
+            acked: false,
+            stream_id: 1,
+            ssn: 0,
+            flags: 0x03,
+            max_retransmits: Some(2),
+            expiry: None,
+        };
+        assert!(SctpInner::should_abandon(&record));
+
+        let record2 = ChunkRecord {
+            transmit_count: 2,
+            max_retransmits: Some(2),
+            ..record.clone()
+        };
+        assert!(!SctpInner::should_abandon(&record2));
+    }
+
+    #[test]
+    fn test_should_abandon_by_expiry() {
+        let record = ChunkRecord {
+            payload: Bytes::from_static(b"data"),
+            sent_time: Instant::now(),
+            transmit_count: 1,
+            missing_reports: 0,
+            abandoned: false,
+            fast_retransmit: false,
+            fast_retransmit_time: None,
+            needs_retransmit: false,
+            in_flight: true,
+            acked: false,
+            stream_id: 1,
+            ssn: 0,
+            flags: 0x03,
+            max_retransmits: None,
+            expiry: Some(Instant::now() - Duration::from_millis(1)),
+        };
+        assert!(SctpInner::should_abandon(&record));
+
+        let record2 = ChunkRecord {
+            expiry: Some(Instant::now() + Duration::from_secs(60)),
+            ..record.clone()
+        };
+        assert!(!SctpInner::should_abandon(&record2));
+    }
+
+    #[test]
+    fn test_should_abandon_reliable_never() {
+        let record = ChunkRecord {
+            payload: Bytes::from_static(b"data"),
+            sent_time: Instant::now(),
+            transmit_count: 100,
+            missing_reports: 0,
+            abandoned: false,
+            fast_retransmit: false,
+            fast_retransmit_time: None,
+            needs_retransmit: false,
+            in_flight: true,
+            acked: false,
+            stream_id: 1,
+            ssn: 0,
+            flags: 0x03,
+            max_retransmits: None,
+            expiry: None,
+        };
+        assert!(!SctpInner::should_abandon(&record));
+    }
+
+    #[test]
+    fn test_pr_sctp_advanced_peer_ack_point_logic() {
+        // Test the logic of advancing past consecutive abandoned chunks
+        let mut sent: BTreeMap<u32, ChunkRecord> = BTreeMap::new();
+        let now = Instant::now();
+
+        // TSN 11: abandoned
+        sent.insert(
+            11,
+            ChunkRecord {
+                payload: Bytes::from_static(b"a"),
+                sent_time: now,
+                transmit_count: 1,
+                missing_reports: 0,
+                abandoned: true,
+                fast_retransmit: false,
+                fast_retransmit_time: None,
+                needs_retransmit: false,
+                in_flight: false,
+                acked: false,
+                stream_id: 1,
+                ssn: 5,
+                flags: 0x03,
+                max_retransmits: None,
+                expiry: None,
+            },
+        );
+        // TSN 12: abandoned
+        sent.insert(
+            12,
+            ChunkRecord {
+                payload: Bytes::from_static(b"b"),
+                sent_time: now,
+                transmit_count: 1,
+                missing_reports: 0,
+                abandoned: true,
+                fast_retransmit: false,
+                fast_retransmit_time: None,
+                needs_retransmit: false,
+                in_flight: false,
+                acked: false,
+                stream_id: 1,
+                ssn: 5,
+                flags: 0x03,
+                max_retransmits: None,
+                expiry: None,
+            },
+        );
+        // TSN 13: not abandoned
+        sent.insert(
+            13,
+            ChunkRecord {
+                payload: Bytes::from_static(b"c"),
+                sent_time: now,
+                transmit_count: 1,
+                missing_reports: 0,
+                abandoned: false,
+                fast_retransmit: false,
+                fast_retransmit_time: None,
+                needs_retransmit: false,
+                in_flight: true,
+                acked: false,
+                stream_id: 1,
+                ssn: 6,
+                flags: 0x03,
+                max_retransmits: None,
+                expiry: None,
+            },
+        );
+
+        let mut advanced: u32 = 10;
+        let mut new_advanced = advanced;
+        let tsns: Vec<u32> = sent.keys().cloned().collect();
+        for tsn in tsns {
+            if tsn != new_advanced.wrapping_add(1) {
+                break;
+            }
+            if let Some(record) = sent.get(&tsn) {
+                if record.abandoned {
+                    new_advanced = tsn;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(
+            new_advanced, 12,
+            "Should advance to 12 (last consecutive abandoned)"
+        );
+        assert!(tsn_gt(new_advanced, advanced));
+
+        // Collect stream/SSN pairs
+        let mut stream_ssn: HashMap<u16, u16> = HashMap::new();
+        for (&t, record) in sent.iter() {
+            if !tsn_gt(t, new_advanced) && record.abandoned {
+                let e = stream_ssn.entry(record.stream_id).or_insert(0);
+                if ssn_gt(record.ssn, *e) || *e == 0 {
+                    *e = record.ssn;
+                }
+            }
+        }
+        assert_eq!(stream_ssn.len(), 1);
+        assert_eq!(*stream_ssn.get(&1).unwrap(), 5);
+
+        // Remove abandoned
+        sent.retain(|t, _| tsn_gt(*t, new_advanced));
+        assert!(!sent.contains_key(&11));
+        assert!(!sent.contains_key(&12));
+        assert!(sent.contains_key(&13));
+    }
+
+    #[test]
+    fn test_forward_tsn_chunk_format() {
+        let advanced: u32 = 42;
+        let stream_ssn_pairs: Vec<(u16, u16)> = vec![(1, 5), (2, 3)];
+
+        let pair_bytes = stream_ssn_pairs.len() * 4;
+        let mut body = BytesMut::with_capacity(4 + pair_bytes);
+        body.put_u32(advanced);
+        for (sid, ssn) in &stream_ssn_pairs {
+            body.put_u16(*sid);
+            body.put_u16(*ssn);
+        }
+
+        let body_len = body.len();
+        let chunk_len = CHUNK_HEADER_SIZE + body_len;
+        let mut chunk_buf = BytesMut::with_capacity(chunk_len);
+        chunk_buf.put_u8(CT_FORWARD_TSN);
+        chunk_buf.put_u8(0);
+        chunk_buf.put_u16(chunk_len as u16);
+        chunk_buf.put(body);
+        let chunk = chunk_buf.freeze();
+
+        assert_eq!(chunk[0], CT_FORWARD_TSN);
+        assert_eq!(chunk[1], 0);
+        let len = u16::from_be_bytes([chunk[2], chunk[3]]) as usize;
+        assert_eq!(len, 4 + 4 + 8); // header + tsn + 2 pairs
+        let tsn = u32::from_be_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        assert_eq!(tsn, 42);
+        let sid1 = u16::from_be_bytes([chunk[8], chunk[9]]);
+        let ssn1 = u16::from_be_bytes([chunk[10], chunk[11]]);
+        assert_eq!(sid1, 1);
+        assert_eq!(ssn1, 5);
+        let sid2 = u16::from_be_bytes([chunk[12], chunk[13]]);
+        let ssn2 = u16::from_be_bytes([chunk[14], chunk[15]]);
+        assert_eq!(sid2, 2);
+        assert_eq!(ssn2, 3);
+    }
+
+    #[test]
+    fn test_forward_tsn_not_generated_when_not_advanced() {
+        let advanced: u32 = 10;
+        let last_sacked: u32 = 10;
+        assert!(!tsn_gt(advanced, last_sacked));
+    }
+
+    // ===== InboundStream Ordered Delivery Tests =====
+
+    #[test]
+    fn test_inbound_stream_in_order_delivery() {
+        let mut stream = InboundStream::new();
+        let msgs = stream.enqueue(0, Bytes::from("msg0"));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0], Bytes::from("msg0"));
+
+        let msgs = stream.enqueue(1, Bytes::from("msg1"));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0], Bytes::from("msg1"));
+
+        assert_eq!(stream.next_ssn, 2);
+    }
+
+    #[test]
+    fn test_inbound_stream_out_of_order_buffering() {
+        let mut stream = InboundStream::new();
+
+        // SSN 2 arrives first — buffered
+        let msgs = stream.enqueue(2, Bytes::from("msg2"));
+        assert!(msgs.is_empty());
+
+        // SSN 1 arrives — still buffered
+        let msgs = stream.enqueue(1, Bytes::from("msg1"));
+        assert!(msgs.is_empty());
+
+        // SSN 0 arrives — all 3 delivered in order
+        let msgs = stream.enqueue(0, Bytes::from("msg0"));
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0], Bytes::from("msg0"));
+        assert_eq!(msgs[1], Bytes::from("msg1"));
+        assert_eq!(msgs[2], Bytes::from("msg2"));
+
+        assert_eq!(stream.next_ssn, 3);
+    }
+
+    #[test]
+    fn test_inbound_stream_gap_blocks_delivery() {
+        let mut stream = InboundStream::new();
+
+        let msgs = stream.enqueue(0, Bytes::from("msg0"));
+        assert_eq!(msgs.len(), 1);
+
+        // SSN 2, skip SSN 1
+        let msgs = stream.enqueue(2, Bytes::from("msg2"));
+        assert!(msgs.is_empty());
+
+        // SSN 3
+        let msgs = stream.enqueue(3, Bytes::from("msg3"));
+        assert!(msgs.is_empty());
+
+        // SSN 1 fills the gap
+        let msgs = stream.enqueue(1, Bytes::from("msg1"));
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0], Bytes::from("msg1"));
+        assert_eq!(msgs[1], Bytes::from("msg2"));
+        assert_eq!(msgs[2], Bytes::from("msg3"));
+    }
+
+    #[test]
+    fn test_inbound_stream_advance_ssn() {
+        let mut stream = InboundStream::new();
+
+        // Buffer some messages
+        stream.enqueue(2, Bytes::from("msg2"));
+        stream.enqueue(3, Bytes::from("msg3"));
+
+        // FORWARD-TSN advances SSN to 2 (skip 0, 1, 2)
+        stream.advance_ssn_to(2);
+        assert_eq!(stream.next_ssn, 3);
+
+        // msg3 should now be deliverable
+        let ready = stream.drain_ready();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0], Bytes::from("msg3"));
+    }
+
+    #[test]
+    fn test_inbound_stream_ssn_wraparound() {
+        let mut stream = InboundStream::new();
+        stream.next_ssn = 65534;
+
+        let msgs = stream.enqueue(65534, Bytes::from("a"));
+        assert_eq!(msgs.len(), 1);
+        let msgs = stream.enqueue(65535, Bytes::from("b"));
+        assert_eq!(msgs.len(), 1);
+        let msgs = stream.enqueue(0, Bytes::from("c"));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(stream.next_ssn, 1);
     }
 }

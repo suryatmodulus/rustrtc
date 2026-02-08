@@ -441,6 +441,10 @@ impl IceTransport {
         self.inner.local_parameters.lock().unwrap().clone()
     }
 
+    pub fn set_remote_parameters(&self, params: IceParameters) {
+        *self.inner.remote_parameters.lock().unwrap() = Some(params);
+    }
+
     fn start_keepalive(&self) {
         // Handled by runner
     }
@@ -544,6 +548,155 @@ impl IceTransport {
         }
         let _ = self.inner.state.send(IceTransportState::Connected);
         Ok(())
+    }
+
+    /// Set up a direct UDP socket for RTP mode without any ICE gathering,
+    /// STUN lookups, or connectivity checks.
+    /// Binds a single socket, registers it, and marks the transport as connected.
+    pub async fn setup_direct_rtp(&self, remote_addr: SocketAddr) -> Result<SocketAddr> {
+        let bind_ip = if let Some(bind_ip_str) = &self.inner.config.bind_ip {
+            bind_ip_str.parse::<IpAddr>().unwrap_or_else(|_| {
+                get_local_ip().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+            })
+        } else if let Ok(ip) = get_local_ip() {
+            ip
+        } else {
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        };
+
+        let socket = self.inner.gatherer.bind_socket(bind_ip).await?;
+        let local_addr = socket.local_addr()?;
+        let socket = Arc::new(socket);
+
+        // Store the socket
+        self.inner
+            .gatherer
+            .sockets
+            .lock()
+            .unwrap()
+            .push(socket.clone());
+
+        // Register the socket wrapper for the read loop (handled by runner)
+        let _ = self
+            .inner
+            .gatherer
+            .socket_tx
+            .send(IceSocketWrapper::Udp(socket.clone()));
+
+        // Build a local candidate for SDP generation
+        let mut cand_addr = local_addr;
+        if let Some(ext_ip) = &self.inner.config.external_ip {
+            if let Ok(parsed_ip) = ext_ip.parse::<IpAddr>() {
+                if !bind_ip.is_loopback() {
+                    cand_addr.set_ip(parsed_ip);
+                }
+            }
+        } else if bind_ip.is_unspecified() {
+            if let Ok(local_ip) = get_local_ip() {
+                cand_addr.set_ip(local_ip);
+            }
+        }
+        let mut local_candidate = IceCandidate::host(cand_addr, 1);
+        if cand_addr != local_addr {
+            local_candidate.related_address = Some(local_addr);
+        }
+        self.inner.gatherer.push_candidate(local_candidate.clone());
+
+        // Set gathering as complete
+        *self.inner.gatherer.state.lock().unwrap() = IceGathererState::Complete;
+        let _ = self.inner.gathering_state.send(IceGathererState::Complete);
+
+        // Set up the selected pair
+        let remote_candidate = IceCandidate::host(remote_addr, 1);
+        let pair = IceCandidatePair::new(local_candidate, remote_candidate);
+        *self.inner.selected_pair.lock().unwrap() = Some(pair.clone());
+        let _ = self.inner.selected_pair_notifier.send(Some(pair));
+        let _ = self
+            .inner
+            .selected_socket
+            .send(Some(IceSocketWrapper::Udp(socket)));
+        let _ = self.inner.state.send(IceTransportState::Connected);
+
+        Ok(cand_addr)
+    }
+
+    /// Set up a direct UDP socket for RTP mode (offer side, no remote addr yet).
+    /// Binds a socket and registers the local candidate, but does NOT set the
+    /// selected pair or transition to Connected.
+    pub async fn setup_direct_rtp_offer(&self) -> Result<SocketAddr> {
+        let bind_ip = if let Some(bind_ip_str) = &self.inner.config.bind_ip {
+            bind_ip_str.parse::<IpAddr>().unwrap_or_else(|_| {
+                get_local_ip().unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+            })
+        } else if let Ok(ip) = get_local_ip() {
+            ip
+        } else {
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        };
+
+        let socket = self.inner.gatherer.bind_socket(bind_ip).await?;
+        let local_addr = socket.local_addr()?;
+        let socket = Arc::new(socket);
+
+        self.inner
+            .gatherer
+            .sockets
+            .lock()
+            .unwrap()
+            .push(socket.clone());
+        let _ = self
+            .inner
+            .gatherer
+            .socket_tx
+            .send(IceSocketWrapper::Udp(socket));
+
+        let mut cand_addr = local_addr;
+        if let Some(ext_ip) = &self.inner.config.external_ip {
+            if let Ok(parsed_ip) = ext_ip.parse::<IpAddr>() {
+                if !bind_ip.is_loopback() {
+                    cand_addr.set_ip(parsed_ip);
+                }
+            }
+        } else if bind_ip.is_unspecified() {
+            if let Ok(local_ip) = get_local_ip() {
+                cand_addr.set_ip(local_ip);
+            }
+        }
+        let mut local_candidate = IceCandidate::host(cand_addr, 1);
+        if cand_addr != local_addr {
+            local_candidate.related_address = Some(local_addr);
+        }
+        self.inner.gatherer.push_candidate(local_candidate);
+
+        *self.inner.gatherer.state.lock().unwrap() = IceGathererState::Complete;
+        let _ = self.inner.gathering_state.send(IceGathererState::Complete);
+
+        Ok(cand_addr)
+    }
+
+    /// Complete the RTP direct connection by setting the remote address.
+    /// Call after setup_direct_rtp_offer when the answer arrives with the remote address.
+    pub fn complete_direct_rtp(&self, remote_addr: SocketAddr) {
+        let remote_candidate = IceCandidate::host(remote_addr, 1);
+        let local_candidate = self
+            .inner
+            .gatherer
+            .local_candidates()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                IceCandidate::host(
+                    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+                    1,
+                )
+            });
+        let pair = IceCandidatePair::new(local_candidate, remote_candidate);
+        *self.inner.selected_pair.lock().unwrap() = Some(pair.clone());
+        let _ = self.inner.selected_pair_notifier.send(Some(pair.clone()));
+        if let Some(socket) = resolve_socket(&self.inner, &pair) {
+            let _ = self.inner.selected_socket.send(Some(socket));
+        }
+        let _ = self.inner.state.send(IceTransportState::Connected);
     }
 
     pub fn stop(&self) {

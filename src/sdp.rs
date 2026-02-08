@@ -627,7 +627,9 @@ impl MediaSection {
         };
 
         self.formats = caps.iter().map(|c| c.payload_type.to_string()).collect();
-        self.attributes.push(Attribute::new("rtcp-mux", None));
+        if config.rtcp_mux_policy == crate::config::RtcpMuxPolicy::Require {
+            self.attributes.push(Attribute::new("rtcp-mux", None));
+        }
         for audio in &caps {
             self.attributes.push(Attribute::new(
                 "rtpmap",
@@ -664,7 +666,9 @@ impl MediaSection {
         };
 
         self.formats = caps.iter().map(|c| c.payload_type.to_string()).collect();
-        self.attributes.push(Attribute::new("rtcp-mux", None));
+        if config.rtcp_mux_policy == crate::config::RtcpMuxPolicy::Require {
+            self.attributes.push(Attribute::new("rtcp-mux", None));
+        }
         for video in &caps {
             self.attributes.push(Attribute::new(
                 "rtpmap",

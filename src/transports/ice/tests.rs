@@ -11,8 +11,9 @@ use ::turn::{
 };
 use anyhow::Result;
 use bytes::Bytes;
+use futures::FutureExt;
 use tokio::sync::broadcast;
-use tokio::time::timeout;
+use tokio::time::{Duration, timeout};
 // use webrtc_util::vnet::net::Net;
 type TurnResult<T> = std::result::Result<T, ::turn::Error>;
 
@@ -435,4 +436,271 @@ fn ice_candidate_foundation_compliance() {
     let host_same_addr = IceCandidate::host(addr, 1);
     let srflx_same_base = IceCandidate::server_reflexive(addr, mapped, 1);
     assert_ne!(host_same_addr.foundation, srflx_same_base.foundation);
+}
+
+#[tokio::test]
+async fn test_ice_lite_stun_response() -> Result<()> {
+    use crate::TransportMode;
+
+    // Create ICE-lite transport (RTP mode)
+    let mut config = RtcConfiguration::default();
+    config.transport_mode = TransportMode::Rtp;
+    config.enable_ice_lite = true;
+    config.bind_ip = Some("127.0.0.1".to_string());
+
+    let (ice_lite, runner) = IceTransport::new(config);
+    tokio::spawn(runner);
+
+    // Set up for RTP mode - bind socket via setup_direct_rtp_offer
+    let local_addr = ice_lite.setup_direct_rtp_offer().await?;
+
+    // Get ICE credentials for authentication
+    let _local_params = ice_lite.local_parameters();
+
+    // Simulate remote ICE agent with credentials
+    let remote_params = IceParameters::new("remote_ufrag", "remote_pwd_12345");
+    ice_lite.set_remote_parameters(remote_params.clone());
+    ice_lite.set_role(IceRole::Controlled);
+
+    // Create a socket to act as the full-ICE remote agent
+    let remote_socket = UdpSocket::bind("127.0.0.1:0").await?;
+    let remote_addr = remote_socket.local_addr()?;
+
+    // Craft STUN binding request - try without authentication first
+    let tx_id = crate::transports::ice::stun::random_bytes::<12>();
+    let binding_request = StunMessage::binding_request(tx_id, Some("ice-lite-test"));
+
+    // Encode without message integrity for basic connectivity
+    let request_bytes = binding_request.encode(None, false)?;
+
+    println!(
+        "Sending STUN Binding Request from {} to ICE-lite agent at {}",
+        remote_addr, local_addr
+    );
+
+    // Send STUN binding request to the ICE-lite transport
+    remote_socket.send_to(&request_bytes, local_addr).await?;
+
+    // Wait for STUN binding response on the remote socket
+    let mut buf = [0u8; 1500];
+    let (len, response_from) =
+        tokio::time::timeout(Duration::from_secs(5), remote_socket.recv_from(&mut buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("Should receive STUN response within 5 seconds"))?
+            .map_err(|e| anyhow::anyhow!("Socket recv error: {}", e))?;
+
+    println!(
+        "Received STUN response from {}, {} bytes",
+        response_from, len
+    );
+
+    // Verify the response is from the ICE-lite agent
+    assert_eq!(
+        response_from, local_addr,
+        "Response should come from ICE-lite local address"
+    );
+
+    // Decode and verify STUN binding success response
+    let decoded_response = StunMessage::decode(&buf[..len])?;
+    assert_eq!(
+        decoded_response.class,
+        crate::transports::ice::stun::StunClass::SuccessResponse
+    );
+    assert_eq!(
+        decoded_response.method,
+        crate::transports::ice::stun::StunMethod::Binding
+    );
+    assert_eq!(
+        decoded_response.transaction_id, tx_id,
+        "Transaction ID should match request"
+    );
+
+    // Verify XOR-MAPPED-ADDRESS attribute (should reflect the requester's address)
+    assert!(
+        decoded_response.xor_mapped_address.is_some(),
+        "STUN response should contain XOR-MAPPED-ADDRESS"
+    );
+
+    let mapped_addr = decoded_response.xor_mapped_address.unwrap();
+    assert_eq!(
+        mapped_addr, remote_addr,
+        "XOR-MAPPED-ADDRESS should reflect remote agent's address"
+    );
+
+    println!("✓ ICE-lite correctly responded to STUN binding request");
+    println!("✓ Response contains correct transaction ID and XOR-MAPPED-ADDRESS");
+
+    // Verify that the remote address was added as a peer reflexive candidate
+    let candidates = ice_lite.remote_candidates();
+    let prflx_candidates: Vec<_> = candidates
+        .iter()
+        .filter(|c| c.typ == IceCandidateType::PeerReflexive && c.address == remote_addr)
+        .collect();
+
+    assert!(
+        !prflx_candidates.is_empty(),
+        "Remote address should be added as peer-reflexive candidate"
+    );
+    println!(
+        "✓ Peer-reflexive candidate discovered for remote address {}",
+        remote_addr
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ice_lite_connectivity_establishment() -> Result<()> {
+    use crate::TransportMode;
+
+    // Set up ICE-lite agent
+    let mut lite_config = RtcConfiguration::default();
+    lite_config.transport_mode = TransportMode::Rtp;
+    lite_config.enable_ice_lite = true;
+    lite_config.bind_ip = Some("127.0.0.1".to_string());
+
+    let (ice_lite, lite_runner) = IceTransport::new(lite_config);
+    tokio::spawn(lite_runner);
+
+    // Set up full-ICE agent
+    let full_config = RtcConfiguration::default();
+    let (ice_full, full_runner) = IceTransportBuilder::new(full_config)
+        .role(IceRole::Controlling)
+        .build();
+    tokio::spawn(full_runner);
+
+    // ICE-lite sets up direct RTP socket
+    let _lite_addr = ice_lite.setup_direct_rtp_offer().await?;
+
+    // Exchange ICE parameters
+    let lite_params = ice_lite.local_parameters();
+    let full_params = ice_full.local_parameters();
+
+    ice_lite.set_remote_parameters(full_params.clone());
+    ice_lite.set_role(IceRole::Controlled);
+
+    // Add ICE-lite candidate to full agent
+    let lite_candidates = ice_lite.local_candidates();
+    assert!(
+        !lite_candidates.is_empty(),
+        "ICE-lite should have local candidates"
+    );
+
+    for candidate in lite_candidates {
+        ice_full.add_remote_candidate(candidate);
+    }
+
+    // Start full ICE agent to trigger candidate gathering
+    ice_full.start(lite_params.clone())?;
+
+    // Wait a bit for candidate gathering
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Complete ICE-lite connection with full agent's candidate
+    let full_candidates = ice_full.local_candidates();
+    let full_host_candidate = full_candidates
+        .iter()
+        .find(|c| c.typ == IceCandidateType::Host)
+        .expect("Full ICE agent should have host candidate")
+        .clone();
+
+    ice_lite.complete_direct_rtp(full_host_candidate.address);
+    ice_lite.add_remote_candidate(full_host_candidate);
+
+    // Wait for both sides to be connected with simpler wait logic
+    let lite_state = ice_lite.subscribe_state();
+    let full_state = ice_full.subscribe_state();
+
+    async fn wait_connected(
+        mut state: watch::Receiver<IceTransportState>,
+        name: &str,
+    ) -> Result<()> {
+        for _ in 0..50 {
+            // 5 second timeout with 100ms intervals
+            let current_state = *state.borrow();
+            if current_state == IceTransportState::Connected {
+                println!("{} transport connected", name);
+                return Ok(());
+            }
+            if current_state == IceTransportState::Failed {
+                return Err(anyhow::anyhow!("{} transport failed", name));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = state.changed().now_or_never();
+        }
+        Err(anyhow::anyhow!(
+            "{} transport did not connect within timeout",
+            name
+        ))
+    }
+
+    tokio::try_join!(
+        wait_connected(lite_state, "ICE-lite"),
+        wait_connected(full_state, "Full ICE")
+    )?;
+
+    // Verify selected pairs
+    let lite_pair = ice_lite.get_selected_pair().await.unwrap();
+    let full_pair = ice_full.get_selected_pair().await.unwrap();
+
+    println!(
+        "ICE-lite selected pair: {} -> {}",
+        lite_pair.local.address, lite_pair.remote.address
+    );
+    println!(
+        "Full ICE selected pair: {} -> {}",
+        full_pair.local.address, full_pair.remote.address
+    );
+
+    // Verify data can flow in both directions
+    let (lite_tx, mut lite_rx) = tokio::sync::mpsc::channel(10);
+    let (full_tx, mut full_rx) = tokio::sync::mpsc::channel(10);
+
+    struct DataReceiver(tokio::sync::mpsc::Sender<Bytes>);
+
+    #[async_trait::async_trait]
+    impl PacketReceiver for DataReceiver {
+        async fn receive(&self, packet: Bytes, _addr: SocketAddr) {
+            // Filter out STUN packets, only forward data
+            if !packet.is_empty() && packet[0] >= 2 {
+                let _ = self.0.send(packet).await;
+            }
+        }
+    }
+
+    ice_lite
+        .set_data_receiver(Arc::new(DataReceiver(lite_tx)))
+        .await;
+    ice_full
+        .set_data_receiver(Arc::new(DataReceiver(full_tx)))
+        .await;
+
+    // Send data from full agent to ICE-lite
+    let full_socket = ice_full.get_selected_socket().await.unwrap();
+    let test_data = Bytes::from_static(b"Hello from full ICE agent");
+    full_socket
+        .send_to(&test_data, lite_pair.local.address)
+        .await?;
+
+    let received_by_lite = timeout(Duration::from_secs(2), lite_rx.recv())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("ICE-lite did not receive data"))?;
+    assert_eq!(received_by_lite, test_data);
+
+    // Send data from ICE-lite to full agent
+    let lite_socket = ice_lite.get_selected_socket().await.unwrap();
+    let response_data = Bytes::from_static(b"Hello from ICE-lite agent");
+    lite_socket
+        .send_to(&response_data, full_pair.local.address)
+        .await?;
+
+    let received_by_full = timeout(Duration::from_secs(2), full_rx.recv())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Full ICE agent did not receive data"))?;
+    assert_eq!(received_by_full, response_data);
+
+    println!("✓ ICE-lite successfully established connectivity with full ICE agent");
+    println!("✓ Bidirectional data flow verified");
+
+    Ok(())
 }

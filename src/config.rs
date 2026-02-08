@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
 use crate::media::depacketizer::{DefaultDepacketizerFactory, DepacketizerFactory};
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 
 /// Describes how credentials are conveyed for a given ICE server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -229,7 +229,6 @@ impl Default for MediaCapabilities {
     }
 }
 
-
 #[derive(Clone)]
 pub struct DepacketizerStrategy {
     pub factory: Arc<dyn DepacketizerFactory>,
@@ -283,6 +282,7 @@ pub struct RtcConfiguration {
     pub rtp_start_port: Option<u16>,
     pub rtp_end_port: Option<u16>,
     pub enable_latching: bool,
+    pub enable_ice_lite: bool,
     #[serde(skip, default)]
     pub depacketizer_strategy: DepacketizerStrategy,
 }
@@ -313,6 +313,7 @@ impl Default for RtcConfiguration {
             rtp_start_port: None,
             rtp_end_port: None,
             enable_latching: false,
+            enable_ice_lite: false,
             depacketizer_strategy: DepacketizerStrategy::default(),
         }
     }
@@ -337,6 +338,11 @@ impl RtcConfigurationBuilder {
 
     pub fn enable_latching(mut self, enable: bool) -> Self {
         self.inner.enable_latching = enable;
+        self
+    }
+
+    pub fn enable_ice_lite(mut self, enable: bool) -> Self {
+        self.inner.enable_ice_lite = enable;
         self
     }
 
