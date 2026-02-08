@@ -146,6 +146,27 @@ impl SampleStreamSource {
             .await
             .map_err(|_| MediaError::Closed)
     }
+
+    pub fn try_send_audio(&self, frame: AudioFrame) -> MediaResult<()> {
+        self.try_send(MediaSample::Audio(frame))
+    }
+
+    pub fn try_send_video(&self, frame: VideoFrame) -> MediaResult<()> {
+        self.try_send(MediaSample::Video(frame))
+    }
+
+    pub fn try_send(&self, sample: MediaSample) -> MediaResult<()> {
+        if sample.kind() != self.kind {
+            return Err(MediaError::KindMismatch {
+                expected: self.kind,
+                actual: sample.kind(),
+            });
+        }
+        self.sender.try_send(sample).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => MediaError::WouldBlock,
+            mpsc::error::TrySendError::Closed(_) => MediaError::Closed,
+        })
+    }
 }
 
 const RELAY_CAPACITY_DEFAULT: usize = 32;
@@ -247,6 +268,11 @@ impl RelayInner {
                                     this.ended.store(true, Ordering::SeqCst);
                                     let _ = this.sender.send(RelayEvent::End);
                                     break;
+                                }
+                                Err(MediaError::WouldBlock) => {
+                                    // This shouldn't happen in recv path, but handle it gracefully
+                                    debug!(target: "rustrtc::media", track = %this.base_id, "unexpected WouldBlock in recv");
+                                    continue;
                                 }
                                 Err(MediaError::Closed) | Err(MediaError::EndOfStream) => {
                                     this.ended.store(true, Ordering::SeqCst);

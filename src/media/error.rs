@@ -12,6 +12,8 @@ pub enum MediaError {
     Lagged,
     #[error("track closed")]
     Closed,
+    #[error("channel is full, would block")]
+    WouldBlock,
     #[error("sample kind mismatch: expected {expected:?} got {actual:?}")]
     KindMismatch {
         expected: MediaKind,
