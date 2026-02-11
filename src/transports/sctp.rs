@@ -5780,7 +5780,7 @@ mod tests {
     #[test]
     fn test_t1_failure_count_limits() {
         let failures = AtomicU32::new(0);
-        for i in 0..SCTP_MAX_INIT_RETRANS {
+        for _ in 0..SCTP_MAX_INIT_RETRANS {
             failures.fetch_add(1, Ordering::SeqCst);
             assert!(failures.load(Ordering::SeqCst) <= SCTP_MAX_INIT_RETRANS as u32);
         }
@@ -6017,7 +6017,7 @@ mod tests {
             },
         );
 
-        let mut advanced: u32 = 10;
+        let advanced: u32 = 10;
         let mut new_advanced = advanced;
         let tsns: Vec<u32> = sent.keys().cloned().collect();
         for tsn in tsns {

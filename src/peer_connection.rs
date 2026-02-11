@@ -1192,10 +1192,20 @@ impl PeerConnection {
                         }
                     }
 
-                    if let Some(ssrc_val) = ssrc
-                        && let Some(rx) = t.receiver.lock().unwrap().as_ref()
-                    {
-                        rx.set_ssrc(ssrc_val);
+                    if let Some(ssrc_val) = ssrc {
+                        if let Some(rx) = t.receiver.lock().unwrap().as_ref() {
+                            rx.set_ssrc(ssrc_val);
+                            if !rx.track_event_sent.swap(true, Ordering::SeqCst) {
+                                let _ = self
+                                    .inner
+                                    .event_tx
+                                    .send(PeerConnectionEvent::Track(t.clone()));
+                                debug!(
+                                    "Answer SDP: Sent Track event for SSRC {} mid={}",
+                                    ssrc_val, mid
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -5560,6 +5570,76 @@ a=mid:0
             !sdp.contains("a=candidate"),
             "Without enable_ice_lite, should not have candidates"
         );
+    }
+
+    /// Test: set_remote_description(Answer) with a=ssrc fires Track event
+    ///
+    /// When the Answer SDP contains `a=ssrc:XXXXX`, the SSRC is latched
+    /// directly from the SDP. Previously, this skipped the Track event
+    /// because the RTP receive loop's SSRC-latching code checked
+    /// `old_ssrc != packet.ssrc`, which matched (already set from SDP).
+    /// The fix fires Track directly in the Answer processing path.
+    #[tokio::test]
+    async fn answer_sdp_with_ssrc_fires_track_event() {
+        use crate::TransportMode;
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let mut config = RtcConfiguration::default();
+        config.transport_mode = TransportMode::Rtp;
+        let pc = PeerConnection::new(config);
+
+        // Add a RecvOnly audio transceiver (simulates the caller expecting media)
+        let transceiver = pc.add_transceiver(MediaKind::Audio, TransceiverDirection::RecvOnly);
+
+        // Create an offer and set as local description to move into HaveLocalOffer
+        let offer = pc.create_offer().await.unwrap();
+        let mid = offer.media_sections[0].mid.clone();
+        pc.set_local_description(offer).unwrap();
+        assert_eq!(pc.signaling_state(), SignalingState::HaveLocalOffer);
+
+        // Construct an Answer SDP that includes a=ssrc:10000
+        let answer_sdp = format!(
+            "v=0\r\n\
+             o=- 1 1 IN IP4 192.168.1.100\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             c=IN IP4 192.168.1.100\r\n\
+             m=audio 5000 RTP/AVP 8\r\n\
+             a=mid:{mid}\r\n\
+             a=recvonly\r\n\
+             a=rtpmap:8 PCMA/8000\r\n\
+             a=ssrc:10000 cname:test-cname\r\n"
+        );
+
+        let answer = SessionDescription::parse(SdpType::Answer, &answer_sdp).unwrap();
+        pc.set_remote_description(answer).await.unwrap();
+        assert_eq!(pc.signaling_state(), SignalingState::Stable);
+
+        // The receiver should have the SSRC from the Answer SDP
+        let receiver = transceiver.receiver().unwrap();
+        assert_eq!(
+            receiver.ssrc(),
+            10000,
+            "Receiver SSRC should be set from Answer SDP"
+        );
+
+        // The Track event should have been sent
+        assert!(
+            receiver.track_event_sent.load(Ordering::SeqCst),
+            "Track event should be marked as sent after Answer with SSRC"
+        );
+
+        // Verify Track event is receivable
+        let event = tokio::time::timeout(std::time::Duration::from_millis(100), pc.recv())
+            .await
+            .expect("Should receive Track event within timeout");
+        assert!(event.is_some(), "Should receive a PeerConnectionEvent");
+        match event.unwrap() {
+            PeerConnectionEvent::Track(t) => {
+                assert_eq!(t.kind(), MediaKind::Audio);
+            }
+            PeerConnectionEvent::DataChannel(_) => panic!("Expected Track event, got DataChannel"),
+        }
     }
 
     #[tokio::test]
